@@ -241,6 +241,25 @@ textarea.ecell{resize:vertical;min-height:28px;overflow:hidden}
 .la-day.weekend{background:rgba(224,122,95,.04)}
 .la-check{width:20px;height:20px;border-radius:5px;background:var(--accent2);margin:0 auto;display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:700}
 
+
+/* CO-DELTA INFO TIP */
+.co-info-tip{position:relative;display:inline-flex;align-items:center;cursor:pointer}
+.co-info-tip .tip-icon{width:15px;height:15px;border-radius:50%;background:var(--gold);color:#fff;font-size:9px;font-weight:700;display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;user-select:none}
+.co-info-tip .tip-body{
+  display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
+  background:var(--text);color:var(--bg);font-size:11px;line-height:1.45;padding:7px 10px;
+  border-radius:7px;white-space:normal;width:260px;z-index:200;box-shadow:0 4px 16px rgba(0,0,0,.18);
+  pointer-events:none;
+}
+.co-info-tip .tip-body::after{content:'';position:absolute;top:100%;left:50%;transform:translateX(-50%);
+  border:5px solid transparent;border-top-color:var(--text)}
+/* Desktop: hover */
+@media(hover:hover){
+  .co-info-tip:hover .tip-body{display:block}
+}
+/* Mobile: click-to-expand via .open class */
+.co-info-tip.open .tip-body{display:block}
+
 /* CATEGORY HEADER */
 .cat-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
 .cat-label{font-size:14px;font-weight:600;color:var(--text-mid)}
@@ -862,30 +881,233 @@ function findLabel(arr, id, labelFn) {
   return item ? labelFn(item) : "";
 }
 
-// ── Link 1: CO → Cost Line (CO affects a cost line) ──
-function coCostLineSelect(co) {
-  const opts = getCostLineOptions();
-  return linkSelect(co.costLineId, opts,
-    `updArr('changeOrders','${co.id}','costLineId',this.value);render()`,
-    "— Cost Line —", "chip-cost");
-}
-function coCostLineChip(co) {
-  const opts = getCostLineOptions();
-  const opt = opts.find(o=>o.id===co.costLineId);
-  return opt ? linkChip(opt.label, "costs", "chip-cost", "📊") : "";
+// ── Link 1 & 2: CO cost splits + linked POs (multi-value) ──
+
+// Normalize: return effective costSplits array, merging legacy costLineId
+function coGetCostSplits(co) {
+  const splits = Array.isArray(co.costSplits) ? co.costSplits : [];
+  // Legacy single costLineId — migrate into splits if not already represented
+  if (co.costLineId && !splits.some(s => s.costLineId === co.costLineId)) {
+    splits.unshift({ id: co.costLineId + "_legacy", costLineId: co.costLineId, amount: co.amountApproved || co.amountSubmitted || 0, linkedPOId: co.linkedPOId||"", note: "" });
+  }
+  return splits;
 }
 
-// ── Link 2: CO → PO (CO tied to a specific PO) ──
-function coPOSelect(co) {
-  const opts = (state.purchaseOrders||[]).map(po=>({ id:po.id, label:`${po.poNumber||"—"} — ${po.vendor||""} ${po.description?`(${po.description})`:""}`.trim() }));
-  return linkSelect(co.linkedPOId, opts,
-    `updArr('changeOrders','${co.id}','linkedPOId',this.value);render()`,
-    "— Linked PO —", "chip-po");
+// Normalize: return effective linkedPOs array, merging legacy linkedPOId
+function coGetLinkedPOs(co) {
+  const links = Array.isArray(co.linkedPOs) ? co.linkedPOs : [];
+  if (co.linkedPOId && !links.some(l => l.poId === co.linkedPOId)) {
+    links.unshift({ id: co.linkedPOId + "_legacy", poId: co.linkedPOId, amount: 0, note: "" });
+  }
+  return links;
 }
-function coPOChip(co) {
-  const label = findLabel(state.purchaseOrders||[], co.linkedPOId, po=>`${po.poNumber||"—"} ${po.vendor||""}`);
-  return label ? linkChip(label, "invoices", "chip-po", "🧾") : "";
+
+// Render multi-chip cell for cost splits
+function coCostSplitsCell(co) {
+  const splits = coGetCostSplits(co);
+  const opts = getCostLineOptions();
+  const chips = splits.map(s => {
+    const opt = opts.find(o => o.id === s.costLineId);
+    const label = opt ? opt.label : "?";
+    const amt = s.amount ? ` ${fmt$(s.amount)}` : "";
+    return `<span class="link-chip chip-cost" title="${esc(label)}${amt}" onclick="activeTab='costs';openModals={};render()">📊 ${esc(label.length > 18 ? label.slice(0,16)+"…" : label)}${amt ? `<span style="opacity:.7;font-size:10px"> ${amt}</span>` : ""}</span>`;
+  }).join("");
+  const addBtn = `<button class="btn-sm-outline" style="font-size:10px;padding:2px 6px;margin-left:2px" onclick="openCOSplitPanel('${co.id}')">＋ Split</button>`;
+  return `<div style="display:flex;flex-wrap:wrap;gap:3px;align-items:center;min-width:120px">${chips || `<span style="color:var(--text-faint);font-size:11px">—</span>`}${addBtn}</div>`;
 }
+
+// Render multi-chip cell for linked POs — now reads from split.linkedPOId
+function coPOLinksCell(co) {
+  const splits = coGetCostSplits(co);
+  const seenPOs = new Set();
+  const chips = splits.flatMap(sp => {
+    if (!sp.linkedPOId) return [];
+    if (seenPOs.has(sp.linkedPOId)) return [];
+    seenPOs.add(sp.linkedPOId);
+    const po = (state.purchaseOrders||[]).find(p => p.id === sp.linkedPOId);
+    if (!po) return [];
+    const label = `${po.poNumber||"—"} ${po.vendor||""}`;
+    return [`<span class="link-chip chip-po" title="${esc(label)}" onclick="activeTab='invoices';expandedPO='${po.id}';openModals={};render()">🧾 ${esc(label.length > 18 ? label.slice(0,16)+"…" : label)}</span>`];
+  }).join("");
+  const addBtn = `<button class="btn-sm-outline" style="font-size:10px;padding:2px 6px;margin-left:2px" onclick="openCOSplitPanel('${co.id}')">＋ Split</button>`;
+  return `<div style="display:flex;flex-wrap:wrap;gap:3px;align-items:center;min-width:120px">${chips || `<span style="color:var(--text-faint);font-size:11px">—</span>`}${addBtn}</div>`;
+}
+
+// Legacy compat (still used in seed migration code)
+function coCostLineSelect(co) { return coCostSplitsCell(co); }
+function coCostLineChip(co)   { return coCostSplitsCell(co); }
+function coPOSelect(co)       { return coPOLinksCell(co); }
+function coPOChip(co)         { return coPOLinksCell(co); }
+
+// ── CO Split Panel state ──
+let _coSplitPanelId = null;
+
+window.openCOSplitPanel = function(coId) {
+  _coSplitPanelId = (_coSplitPanelId === coId) ? null : coId;
+  render();
+};
+
+// Render the inline split editor panel for a CO row
+function renderCOSplitPanel(co) {
+  const splits = coGetCostSplits(co);
+  const costOpts = getCostLineOptions();
+  const poOpts = (state.purchaseOrders||[]).map(po => ({ id: po.id, label: `${po.poNumber||"—"} — ${po.vendor||""}` }));
+
+  // Calculate split totals vs CO approved amount
+  const totalSplitAmt = splits.reduce((s, sp) => s + (+sp.amount||0), 0);
+  const totalApproved = +co.amountApproved || +co.amountSubmitted || 0;
+  const splitDiff = totalApproved - totalSplitAmt;
+
+  // ── Cost splits table (PO linked per-row) ──
+  let splitsHtml = `
+    <div style="font-size:11px;font-weight:700;color:var(--text-lt);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;display:flex;align-items:center;gap:10px">
+      Cost Type Splits
+      <span style="font-weight:400;color:${Math.abs(splitDiff)<0.01?'var(--green)':'var(--gold)'}">
+        ${fmt$(totalSplitAmt)} of ${fmt$(totalApproved)}${Math.abs(splitDiff)>0.01 ? ` · <strong>${fmt$(Math.abs(splitDiff))} ${splitDiff>0?'unallocated':'over'}</strong>` : ' ✓'}
+      </span>
+    </div>
+    <table style="width:100%;border-collapse:collapse;font-size:12px;margin-bottom:4px">
+      <thead><tr style="background:var(--surface)">
+        <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--text-lt);font-size:11px;border-bottom:1px solid var(--border)">Cost Type</th>
+        <th style="padding:4px 8px;text-align:right;font-weight:600;color:var(--text-lt);font-size:11px;border-bottom:1px solid var(--border)">Amount</th>
+        <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--text-lt);font-size:11px;border-bottom:1px solid var(--border)">Linked PO <span style="font-weight:400;opacity:.7">(optional)</span></th>
+        <th style="padding:4px 8px;text-align:right;font-weight:600;color:var(--text-lt);font-size:11px;border-bottom:1px solid var(--border)">PO Value</th>
+        <th style="padding:4px 8px;text-align:left;font-weight:600;color:var(--text-lt);font-size:11px;border-bottom:1px solid var(--border)">Note</th>
+        <th style="padding:4px 4px;border-bottom:1px solid var(--border);width:28px"></th>
+      </tr></thead>
+      <tbody>`;
+  if (!splits.length) {
+    splitsHtml += `<tr><td colspan="6" style="padding:8px;color:var(--text-faint);font-size:11px;text-align:center">No cost splits yet — click below to add one</td></tr>`;
+  }
+  for (const sp of splits) {
+    const linkedPO = sp.linkedPOId ? (state.purchaseOrders||[]).find(p=>p.id===sp.linkedPOId) : null;
+    const poDisplayAmt = linkedPO ? (+linkedPO.adjustedAmount||+linkedPO.originalAmount||0) : null;
+    splitsHtml += `<tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:4px 8px">
+        <select style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--surface);max-width:180px"
+          onchange="updCOSplit('${co.id}','${sp.id}','costLineId',this.value)">
+          <option value="">— Cost Line —</option>
+          ${costOpts.map(o=>`<option value="${o.id}" ${o.id===sp.costLineId?"selected":""}>${esc(o.label)}</option>`).join("")}
+        </select>
+      </td>
+      <td style="padding:4px 8px;text-align:right">
+        <input type="number" step="any" value="${sp.amount||""}" placeholder="0"
+          style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;width:90px;text-align:right;background:var(--surface)"
+          onchange="updCOSplit('${co.id}','${sp.id}','amount',+this.value||0)">
+      </td>
+      <td style="padding:4px 8px">
+        <select style="font-size:11px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;background:var(--surface);max-width:200px"
+          onchange="updCOSplit('${co.id}','${sp.id}','linkedPOId',this.value)">
+          <option value="">— No PO —</option>
+          ${poOpts.map(o=>`<option value="${o.id}" ${o.id===sp.linkedPOId?"selected":""}>${esc(o.label)}</option>`).join("")}
+        </select>
+      </td>
+      <td style="padding:4px 8px;text-align:right;color:var(--text-lt);font-size:11px">
+        ${poDisplayAmt !== null ? `<span style="font-variant-numeric:tabular-nums">${fmt$(poDisplayAmt)}</span>` : `<span style="color:var(--text-faint)">—</span>`}
+      </td>
+      <td style="padding:4px 8px">
+        <input type="text" value="${esc(sp.note||"")}" placeholder="e.g. additional labor for CO scope"
+          style="font-size:11px;padding:2px 6px;border:1px solid var(--border);border-radius:4px;width:100%;background:var(--surface)"
+          onchange="updCOSplit('${co.id}','${sp.id}','note',this.value)">
+      </td>
+      <td style="padding:4px 4px;text-align:center">
+        <button class="btn-danger" style="font-size:11px;padding:1px 5px" onclick="rmCOSplit('${co.id}','${sp.id}')">×</button>
+      </td>
+    </tr>`;
+  }
+  splitsHtml += `</tbody></table>
+    <button class="btn-sm-outline" style="font-size:11px;margin-bottom:4px" onclick="addCOSplit('${co.id}')">+ Add Cost Type Split</button>`;
+
+  return `<tr id="cosplit_${co.id}">
+    <td colspan="11" style="padding:0;background:var(--surface);border-top:none">
+      <div style="padding:14px 18px 16px;border:1px solid var(--accent2);border-top:2px solid var(--accent2);border-radius:0 0 8px 8px;background:var(--surface)">
+        ${splitsHtml}
+        <div style="margin-top:10px;text-align:right">
+          <button class="btn-sm-outline" onclick="openCOSplitPanel('${co.id}')">Close</button>
+        </div>
+      </div>
+    </td>
+  </tr>`;
+}
+
+// ── CO Split CRUD operations ──
+window.addCOSplit = function(coId) {
+  const co = (state.changeOrders||[]).find(c => c.id === coId);
+  if (!co) return;
+  if (!Array.isArray(co.costSplits)) co.costSplits = [];
+  // Migrate legacy into array first
+  if (co.costLineId && !co.costSplits.some(s => s.costLineId === co.costLineId)) {
+    co.costSplits.unshift({ id: uid(), costLineId: co.costLineId, amount: co.amountApproved || co.amountSubmitted || 0, note: "" });
+    co.costLineId = "";
+  }
+  co.costSplits.push({ id: uid(), costLineId: "", amount: 0, linkedPOId: "", note: "" });
+  saveData(state); render();
+};
+
+window.updCOSplit = function(coId, splitId, field, value) {
+  const co = (state.changeOrders||[]).find(c => c.id === coId);
+  if (!co || !Array.isArray(co.costSplits)) return;
+  const sp = co.costSplits.find(s => s.id === splitId);
+  // Handle legacy shim id
+  if (!sp) {
+    // Could be legacy — migrate first
+    if (!co.costSplits.some(s => s.costLineId === co.costLineId)) {
+      co.costSplits.unshift({ id: co.costLineId + "_legacy", costLineId: co.costLineId, amount: co.amountApproved || co.amountSubmitted || 0, note: "" });
+      co.costLineId = "";
+    }
+    const sp2 = co.costSplits.find(s => s.id === splitId);
+    if (sp2) { sp2[field] = value; sp2.id = uid(); }
+  } else {
+    sp[field] = value;
+  }
+  saveData(state); render();
+};
+
+window.rmCOSplit = function(coId, splitId) {
+  const co = (state.changeOrders||[]).find(c => c.id === coId);
+  if (!co) return;
+  if (!Array.isArray(co.costSplits)) co.costSplits = [];
+  co.costSplits = co.costSplits.filter(s => s.id !== splitId);
+  // Also clear legacy if it was the legacy one
+  saveData(state); render();
+};
+
+window.addCOLinkedPO = function(coId) {
+  const co = (state.changeOrders||[]).find(c => c.id === coId);
+  if (!co) return;
+  if (!Array.isArray(co.linkedPOs)) co.linkedPOs = [];
+  if (co.linkedPOId && !co.linkedPOs.some(l => l.poId === co.linkedPOId)) {
+    co.linkedPOs.unshift({ id: uid(), poId: co.linkedPOId, amount: 0, note: "" });
+    co.linkedPOId = "";
+  }
+  co.linkedPOs.push({ id: uid(), poId: "", amount: 0, note: "" });
+  saveData(state); render();
+};
+
+window.updCOLinkedPO = function(coId, linkId, field, value) {
+  const co = (state.changeOrders||[]).find(c => c.id === coId);
+  if (!co || !Array.isArray(co.linkedPOs)) return;
+  const lk = co.linkedPOs.find(l => l.id === linkId);
+  if (!lk) {
+    if (!co.linkedPOs.some(l => l.poId === co.linkedPOId) && co.linkedPOId) {
+      co.linkedPOs.unshift({ id: co.linkedPOId + "_legacy", poId: co.linkedPOId, amount: 0, note: "" });
+      co.linkedPOId = "";
+    }
+    const lk2 = co.linkedPOs.find(l => l.id === linkId);
+    if (lk2) { lk2[field] = value; lk2.id = uid(); }
+  } else {
+    lk[field] = value;
+  }
+  saveData(state); render();
+};
+
+window.rmCOLinkedPO = function(coId, linkId) {
+  const co = (state.changeOrders||[]).find(c => c.id === coId);
+  if (!co) return;
+  if (!Array.isArray(co.linkedPOs)) co.linkedPOs = [];
+  co.linkedPOs = co.linkedPOs.filter(l => l.id !== linkId);
+  saveData(state); render();
+};
 
 // ── Link 3: PO → Cost Line (invoice charges against cost code) ──
 function poCostLineSelect(po) {
@@ -954,7 +1176,7 @@ window.convertSubToPO = (subId) => {
     if (existing) { activeTab="invoices"; expandedPO=existing.id; render(); return; }
   }
   // Create PO from quote
-  const quoteAmt = parseFloat(String(sub.quote).replace(/[^0-9.]/g,""))||0;
+  const quoteAmt = +sub.quoteAmount||parseFloat(String(sub.quote||0).replace(/[^0-9.]/g,""))||0;
   const newPO = {
     id: uid(),
     poNumber: "",
@@ -984,6 +1206,10 @@ window.rmArr = (path, id) => {
   if (path==="purchaseOrders") {
     cleanLinks(state.changeOrders, "linkedPOId");
     cleanLinks(state.subcontractors, "linkedPOId");
+    // Also clean from costSplits/linkedPOs arrays
+    (state.changeOrders||[]).forEach(co => {
+      if (Array.isArray(co.linkedPOs)) co.linkedPOs = co.linkedPOs.filter(l => l.poId !== id);
+    });
   }
   if (path==="submittals") cleanLinks(state.rfis, "linkedSubmittalId");
   if (path==="drawings")   cleanLinks(state.rfis, "linkedDrawingId");
@@ -994,13 +1220,23 @@ window.rmArr = (path, id) => {
     cleanLinks(state.changeOrders,    "costLineId");
     cleanLinks(state.purchaseOrders,  "costLineId");
     cleanLinks(state.subcontractors,  "costLineId");
+    // Also clean from costSplits arrays
+    (state.changeOrders||[]).forEach(co => {
+      if (Array.isArray(co.costSplits)) co.costSplits = co.costSplits.filter(s => s.costLineId !== id);
+    });
   }
   removeFromArray(path, id);
 };
 
 // ── Inbound links: which items link TO a given cost line? ──
 function getLinksToConstLine(costLineId) {
-  const cos  = (state.changeOrders||[]).filter(c=>c.costLineId===costLineId);
+  const cos  = (state.changeOrders||[]).filter(c => {
+    // Check legacy single field
+    if (c.costLineId === costLineId) return true;
+    // Check costSplits array
+    if (Array.isArray(c.costSplits) && c.costSplits.some(s => s.costLineId === costLineId)) return true;
+    return false;
+  });
   const pos  = (state.purchaseOrders||[]).filter(p=>p.costLineId===costLineId);
   const subs = (state.subcontractors||[]).filter(s=>s.costLineId===costLineId);
   return { cos, pos, subs };
@@ -1624,12 +1860,12 @@ function ecell(value, onchangeExpr, type="text", placeholder="") {
 }
 
 // Currency display cell — shows formatted $X,XXX.XX, edits as plain number on click
-function ecellCurrency(value, onchangeExpr, allowNegative=true) {
+function ecellCurrency(value, onchangeExpr, allowNegative=true, positiveColor=null) {
   const num = parseFloat(value);
   const isEmpty = value == null || value === "" || isNaN(num);
   const display = isEmpty ? "" : fmt$(num);
   const raw = isEmpty ? "" : String(num);
-  const color = !isEmpty && num < 0 ? "color:var(--red)" : "";
+  const color = !isEmpty && positiveColor && num > 0 ? `color:${positiveColor}` : (!isEmpty && num < 0 ? "color:var(--red)" : "");
   return `<span class="ecell-currency-wrap" style="display:block;position:relative">
     <span class="ecell-currency-display" style="display:block;font-size:13px;font-variant-numeric:tabular-nums;padding:4px 6px;border-radius:6px;border:1px solid transparent;cursor:text;min-width:80px;${color}" onclick="this.style.display='none';this.nextElementSibling.style.display='block';this.nextElementSibling.focus();this.nextElementSibling.select()">${esc(display)||'<span style="color:var(--text-faint)">—</span>'}</span>
     <input class="ecell" type="number" step="any" value="${esc(raw)}" style="display:none" placeholder="0"
@@ -1704,49 +1940,247 @@ function renderOverview() {
 }
 window.updProj = (k,v) => { state.project[k]=v; saveData(state); };
 
+
+// ═══════════════════════════════════════════════════════════════════
+// CO DELTA ENGINE
+// Computes approved CO impact on a cost line without mutating state.
+//
+// For each approved CO split pointing at costLineId:
+//   - No linked PO  → adds to projDelta (open scope risk)
+//   - Linked PO already within Viewpoint committed → no delta (already counted)
+//   - Linked PO NOT yet in Viewpoint committed → adds to commitDelta + warning
+//
+// "Already in Viewpoint" test:
+//   Sort POs linked to this cost line by orderDate ascending (oldest first).
+//   Greedily accumulate their adjustedAmount until we've consumed the imported
+//   committed value. POs within that budget are "known to Viewpoint"; remainder
+//   are "unreconciled". The CO split amount is added to commitDelta only when
+//   its linked PO falls in the unreconciled portion.
+// ═══════════════════════════════════════════════════════════════════
+function computeCODeltas(costLineId, baseCommitted) {
+  const cos = state.changeOrders || [];
+  const pos = state.purchaseOrders || [];
+
+  // ── Determine which POs are already within Viewpoint's committed budget ──
+  // POs directly linked to this cost line, sorted oldest-first
+  const linePOs = pos
+    .filter(p => p.costLineId === costLineId)
+    .sort((a,b) => {
+      const da = a.orderDate||a.dateCreated||"0";
+      const db = b.orderDate||b.dateCreated||"0";
+      return da < db ? -1 : da > db ? 1 : 0;
+    });
+
+  let vpBudgetRemaining = +baseCommitted || 0;
+  const vpKnownPOIds = new Set();
+  for (const po of linePOs) {
+    const amt = +po.adjustedAmount || +po.originalAmount || 0;
+    if (amt <= vpBudgetRemaining + 0.01) {
+      vpKnownPOIds.add(po.id);
+      vpBudgetRemaining -= amt;
+    }
+    // Once we exceed committed, remaining POs are unreconciled
+  }
+
+  let projDelta   = 0;   // adds to Displayed Projected
+  let commitDelta = 0;   // adds to Displayed Committed
+  const warnings  = [];  // {poId, poNumber, vendor} for ⓘ tooltip
+
+  for (const co of cos) {
+    const approved = +co.amountApproved || 0;
+    if (!approved) continue; // only approved COs
+
+    const splits = coGetCostSplits(co);
+    for (const sp of splits) {
+      if (sp.costLineId !== costLineId) continue;
+      const amt = +sp.amount || 0;
+      if (!amt) continue;
+
+      if (sp.linkedPOId) {
+        // Split is backed by a PO
+        if (vpKnownPOIds.has(sp.linkedPOId)) {
+          // PO already in Viewpoint committed — no delta needed
+        } else {
+          // PO not yet reconciled with Viewpoint
+          commitDelta += amt;
+          const po = pos.find(p => p.id === sp.linkedPOId);
+          if (po && !warnings.some(w => w.poId === po.id)) {
+            warnings.push({ poId: po.id, poNumber: po.poNumber||"—", vendor: po.vendor||"" });
+          }
+        }
+      } else {
+        // No PO linked — pure scope risk, adjusts projected
+        projDelta += amt;
+      }
+    }
+  }
+
+  return { projDelta, commitDelta, warnings };
+}
+
 // --- COST BREAKDOWN ---
 function renderCosts() {
   const cats = [
-    {key:"labor",label:"Direct Labor",icon:""},{key:"indirectLabor",label:"Indirect Labor",icon:""},
-    {key:"material",label:"Material",icon:""},{key:"subs",label:"Subcontractors",icon:""},
-    {key:"equipment",label:"Equipment",icon:""},{key:"admin",label:"Admin / Overhead",icon:""}
+    {key:"labor",label:"Direct Labor",icon:""},
+    {key:"indirectLabor",label:"Indirect Labor",icon:""},
+    {key:"material",label:"Material",icon:""},
+    {key:"subs",label:"Subcontractors",icon:""},
+    {key:"equipment",label:"Equipment",icon:""},
+    {key:"admin",label:"Admin / Overhead",icon:""}
   ];
   const all = cats.flatMap(c=>(state.costs[c.key]||[]));
-  const gB=all.reduce((s,l)=>s+(+l.budget||0),0), gC=all.reduce((s,l)=>s+(+l.committed||0),0), gA=all.reduce((s,l)=>s+(+l.actual||0),0), gF=all.reduce((s,l)=>s+(+l.forecast||0),0);
+
+  // ── Project-level summary aggregates (CO-adjusted) ──
+  const gEst  = all.reduce((s,l)=>s+(+l.budget||0),0);
+  const gMTD  = all.reduce((s,l)=>s+(+l.mtd||0),0);
+  const gJTD  = all.reduce((s,l)=>s+(+l.actual||0),0);
+  const gUAP  = all.reduce((s,l)=>s+(+l.unapprovedAP||0),0);
+  // Apply CO deltas to projected and committed totals
+  const gProj = all.reduce((s,l)=>{ const {projDelta} = computeCODeltas(l.id, +l.committed||0); return s+(+l.forecast||0)+projDelta; },0);
+  const gComm = all.reduce((s,l)=>{ const {commitDelta} = computeCODeltas(l.id, +l.committed||0); return s+(+l.committed||0)+commitDelta; },0);
+  const gVar  = gEst - gProj;
+  const gPct  = gEst > 0 ? Math.round((gJTD/gEst)*1000)/10 : 0;
 
   let html = `<div class="page-title" data-module="costs">Cost Breakdown</div>`;
   html += secHeader("Cost Breakdown");
-  html += `<div class="stat-grid">
-    ${statCard("Total Budget",fmt$(gB),"var(--accent2)")}
-    ${statCard("Committed",fmt$(gC),"var(--gold)")}
-    ${statCard("Total Actual",fmt$(gA),"var(--accent)")}
-    ${statCard("Total Forecast",fmt$(gF),"var(--text-mid)")}
-    ${statCard("Variance",fmt$(gB-gF),gB-gF>=0?"var(--green)":"var(--red)")}
+  html += `<div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(148px,1fr))">
+    ${statCard("Estimated",fmt$(gEst),"var(--accent2)")}
+    ${statCard("Month To Date",fmt$(gMTD),"var(--text-mid)")}
+    ${statCard("Job To Date",fmt$(gJTD),"var(--accent)")}
+    ${statCard("Projected",fmt$(gProj),"var(--text-mid)")}
+    ${statCard("Variance",fmt$(gVar),gVar>=0?"var(--green)":"var(--red)")}
+    ${statCard("% Complete",gPct.toFixed(1)+"%",gPct>=100?"var(--green)":gPct>=75?"var(--accent)":"var(--gold)")}
+    ${statCard("Open / Committed",fmt$(gComm),"var(--gold)")}
+    ${statCard("Unapproved AP",fmt$(gUAP),gUAP>0?"var(--red)":"var(--text-faint)")}
   </div>`;
+
+  // ── % complete mini progress pill ──
+  function pctPill(val) {
+    if (val === null || val === undefined || val === "") return `<span style="color:var(--text-faint);font-size:11px">—</span>`;
+    const n = +val;
+    const col = n >= 100 ? "var(--green)" : n >= 75 ? "var(--accent)" : n >= 40 ? "var(--gold)" : "var(--red)";
+    return `<div style="min-width:60px">
+      <span style="font-size:12px;font-weight:700;color:${col}">${n.toFixed(1)}%</span>
+      <div style="height:3px;border-radius:2px;background:var(--border);margin-top:3px;overflow:hidden">
+        <div style="height:100%;width:${Math.min(100,Math.max(0,n))}%;background:${col};border-radius:2px"></div>
+      </div>
+    </div>`;
+  }
 
   for (const cat of cats) {
     const lines = state.costs[cat.key]||[];
-    const cB=lines.reduce((a,l)=>a+(+l.budget||0),0), cC=lines.reduce((a,l)=>a+(+l.committed||0),0), cA=lines.reduce((a,l)=>a+(+l.actual||0),0);
+    const cEst  = lines.reduce((a,l)=>a+(+l.budget||0),0);
+    const cMTD  = lines.reduce((a,l)=>a+(+l.mtd||0),0);
+    const cJTD  = lines.reduce((a,l)=>a+(+l.actual||0),0);
+    const cUAP  = lines.reduce((a,l)=>a+(+l.unapprovedAP||0),0);
+    const cProj = lines.reduce((a,l)=>{ const {projDelta}   = computeCODeltas(l.id, +l.committed||0); return a+(+l.forecast||0)+projDelta; },0);
+    const cComm = lines.reduce((a,l)=>{ const {commitDelta} = computeCODeltas(l.id, +l.committed||0); return a+(+l.committed||0)+commitDelta; },0);
+    const cVar  = cEst - cProj;
+    const cPct  = cEst > 0 ? Math.round((cJTD/cEst)*1000)/10 : null;
+
     html += `<div class="cat-header">
-      <span class="cat-label">${cat.icon?cat.icon+" ":""}${esc(cat.label)} <span class="cat-sub">— Budget: ${fmt$(cB)} | Committed: ${fmt$(cC)} | Actual: ${fmt$(cA)}</span></span>
+      <span class="cat-label">${cat.icon?cat.icon+" ":""}${esc(cat.label)}
+        <span class="cat-sub">— Est: ${fmt$(cEst)} | JTD: ${fmt$(cJTD)} | Proj: ${fmt$(cProj)} | Var: <span style="color:${cVar>=0?"var(--green)":"var(--red)"}">${fmt$(cVar)}</span>${cUAP>0?` | <span style="color:var(--red)">Unap. AP: ${fmt$(cUAP)}</span>`:""}</span>
+      </span>
       <button class="btn-sm-outline" onclick="addCostLine('${cat.key}')">+ Line</button>
     </div>`;
+
     if (lines.length > 0) {
-      html += `<div class="table-wrap" style="margin-bottom:20px"><table>
-        <thead><tr><th style="width:28%">Description</th><th>Budget</th><th>Committed</th><th>Actual</th><th>Forecast</th><th>Variance</th><th>Linked</th><th style="width:40px"></th></tr></thead><tbody>`;
+      html += `<div class="table-wrap" style="margin-bottom:20px;overflow-x:auto"><table style="min-width:1080px">
+        <thead><tr>
+          <th style="min-width:180px">Description</th>
+          <th class="right" title="Original budget / estimate from contract">Estimated</th>
+          <th class="right" title="Costs posted this calendar month">Month To Date</th>
+          <th class="right" title="All costs posted to date (Job To Date)">Job To Date</th>
+          <th class="right" title="Projected final cost at completion">Projected</th>
+          <th class="right" title="Estimated minus Projected (positive = under budget)">Variance</th>
+          <th style="min-width:86px" title="Job To Date ÷ Estimated — editable">% Complete</th>
+          <th class="right" title="Open purchase orders / committed subcontract spend">Open / Committed</th>
+          <th class="right" title="Invoices received but not yet approved in AP">Unapproved AP</th>
+          <th style="min-width:100px">Linked</th>
+          <th style="width:34px"></th>
+        </tr></thead><tbody>`;
+
       for (const l of lines) {
-        const v = (+l.budget||0)-(+l.forecast||0);
+        const est  = +l.budget||0;
+        const mtd  = +l.mtd||0;
+        const jtd  = +l.actual||0;
+        const baseProj = +l.forecast||0;
+        const baseComm = +l.committed||0;
+        const uap  = +l.unapprovedAP||0;
+
+        // ── CO delta computation ──
+        const { projDelta, commitDelta, warnings: coWarnings } = computeCODeltas(l.id, baseComm);
+        const proj = baseProj + projDelta;
+        const comm = baseComm + commitDelta;
+
+        // pctComplete: stored manual override > computed from JTD/Est
+        const pctStored = (l.pctComplete !== null && l.pctComplete !== undefined && l.pctComplete !== "");
+        const pct = pctStored ? +l.pctComplete : (est > 0 && jtd > 0 ? Math.round((jtd/est)*1000)/10 : null);
+        const vari = est - proj;
+        const hasData = est||mtd||jtd||proj||comm||uap;
         const {cos:lkCOs, pos:lkPOs, subs:lkSubs} = getLinksToConstLine(l.id);
         const linkCount = lkCOs.length + lkPOs.length + lkSubs.length;
+
+        // ── ⓘ warning tooltip markup ──
+        function infoTip(warnings) {
+          if (!warnings.length) return "";
+          const lines = warnings.map(w =>
+            `PO ${w.poNumber}${w.vendor ? " — "+w.vendor : ""} exists in PlanWise but may not be reflected in Viewpoint as of last import. Confirm in Viewpoint, then reimport today\u2019s Job Cost report to reconcile.`
+          ).join("\n\n");
+          const tipId = "tip_" + l.id;
+          return `<span class="co-info-tip" id="${tipId}"
+            onclick="event.stopPropagation();document.getElementById('${tipId}').classList.toggle('open')"
+            ontouchstart="event.stopPropagation();document.getElementById('${tipId}').classList.toggle('open')">
+            <span class="tip-icon" title="PO reconciliation warning">ⓘ</span>
+            <span class="tip-body">${esc(lines)}</span>
+          </span>`;
+        }
+
+        // ── CO delta badge (shows +/- adjustment on projected or committed) ──
+        function deltaBadge(delta, color) {
+          if (!delta) return "";
+          const sign = delta > 0 ? "+" : "";
+          return `<span style="font-size:10px;color:${color};opacity:.85;margin-left:4px;font-weight:600">${sign}${fmt$(delta)} CO</span>`;
+        }
+
         html += `<tr>
           <td>${ecell(l.name,`updCost('${cat.key}','${l.id}','name',this.value)`,"text","Line item…")}</td>
-          <td class="mono right">${ecell(l.budget,`updCost('${cat.key}','${l.id}','budget',this.value)`,"number")}</td>
-          <td class="mono right">${ecell(l.committed,`updCost('${cat.key}','${l.id}','committed',this.value)`,"number")}</td>
-          <td class="mono right">${ecell(l.actual,`updCost('${cat.key}','${l.id}','actual',this.value)`,"number")}</td>
-          <td class="mono right">${ecell(l.forecast,`updCost('${cat.key}','${l.id}','forecast',this.value)`,"number")}</td>
-          <td class="mono right" style="color:${v>=0?"var(--green)":"var(--red)"};font-weight:600">${(l.budget||l.forecast||l.actual||l.committed) ? fmt$(v) : "—"}</td>
-          <td style="min-width:110px">
-            ${linkCount === 0 ? `<span style="color:var(--text-faint);font-size:11px">—</span>` : `
+          <td class="mono right" style="position:relative">${l.budgetLocked
+            ? `<span style="display:flex;align-items:center;gap:5px;justify-content:flex-end">
+                <span class="mono" style="font-size:13px">${fmt$(est)}</span>
+                <button onclick="unlockBudget('${cat.key}','${l.id}')" title="Estimated locked from import — click to unlock"
+                  style="border:none;background:none;cursor:pointer;padding:0;color:var(--text-lt);font-size:12px;line-height:1;flex-shrink:0">🔒</button>
+               </span>`
+            : ecellCurrency(est,`updCost('${cat.key}','${l.id}','budget',+this.value||0)`)
+          }</td>
+          <td class="mono right" style="color:var(--text-mid)">${ecellCurrency(mtd,`updCost('${cat.key}','${l.id}','mtd',+this.value||0)`)}</td>
+          <td class="mono right">${ecellCurrency(jtd,`updCost('${cat.key}','${l.id}','actual',+this.value||0)`)}</td>
+          <td class="mono right">
+            <div style="display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:2px">
+              ${ecellCurrency(baseProj,`updCost('${cat.key}','${l.id}','forecast',+this.value||0)`)}
+              ${projDelta ? deltaBadge(projDelta, projDelta>0?"var(--gold)":"var(--green)") : ""}
+            </div>
+          </td>
+          <td class="mono right" style="color:${vari>=0?"var(--green)":"var(--red)"};font-weight:600">${hasData ? fmt$(vari) : "—"}</td>
+          <td>
+            ${pctPill(pct)}
+            <input type="number" min="0" max="100" step="0.1"
+              value="${pct!==null?pct:""}" placeholder="auto"
+              title="Override % complete (leave blank to auto-calculate from JTD÷Est)"
+              style="width:54px;font-size:10px;padding:2px 4px;border:1px solid var(--border);border-radius:4px;margin-top:3px;background:var(--surface);color:var(--text);display:block"
+              onchange="updCost('${cat.key}','${l.id}','pctComplete',this.value===''?null:+this.value||0);render()">
+          </td>
+          <td class="mono right" style="color:var(--gold)">
+            <div style="display:flex;align-items:center;justify-content:flex-end;flex-wrap:wrap;gap:2px">
+              ${ecellCurrency(baseComm,`updCost('${cat.key}','${l.id}','committed',+this.value||0)`)}
+              ${commitDelta ? deltaBadge(commitDelta, "var(--gold)") : ""}
+              ${infoTip(coWarnings)}
+            </div>
+          </td>
+          <td class="mono right" style="${uap>0?"color:var(--red);font-weight:600":""}">${ecellCurrency(uap,`updCost('${cat.key}','${l.id}','unapprovedAP',+this.value||0)`,true,uap>0?"var(--red)":null)}</td>
+          <td style="min-width:100px">
+            ${linkCount===0 ? `<span style="color:var(--text-faint);font-size:11px">—</span>` : `
               <div style="display:flex;flex-wrap:wrap;gap:3px">
                 ${lkCOs.map(co=>linkChip(`CO ${co.coNumber||"—"}`, "changeOrders", "chip-co", "📝")).join("")}
                 ${lkPOs.map(po=>linkChip(`${po.poNumber||po.vendor||"PO"}`, "invoices", "chip-po", "🧾")).join("")}
@@ -1756,16 +2190,22 @@ function renderCosts() {
           <td><button class="btn-danger" onclick="rmCost('${cat.key}','${l.id}')">×</button></td>
         </tr>`;
       }
-      const cF = lines.reduce((a,l)=>a+(+l.forecast||0),0);
-      const cV = cB - cF;
+
+      // ── Subtotal row ──
       if (lines.length > 1) {
+        const cPctDisp = cEst > 0 ? Math.round((cJTD/cEst)*1000)/10 : null;
+        const cVarCol  = cVar >= 0 ? "var(--green)" : "var(--red)";
+        const cPctCol  = cPctDisp===null?"var(--text-lt)":cPctDisp>=100?"var(--green)":cPctDisp>=75?"var(--accent)":"var(--gold)";
         html += `<tr style="font-weight:700;background:var(--surface);font-size:12px;border-top:2px solid var(--border)">
           <td style="color:var(--text-lt)">Subtotal</td>
-          <td class="mono right">${fmt$(cB)}</td>
-          <td class="mono right" style="color:var(--gold)">${fmt$(cC)}</td>
-          <td class="mono right">${fmt$(cA)}</td>
-          <td class="mono right">${fmt$(cF)}</td>
-          <td class="mono right" style="color:${cV>=0?"var(--green)":"var(--red)"}">${fmt$(cV)}</td>
+          <td class="mono right">${fmt$(cEst)}</td>
+          <td class="mono right" style="color:var(--text-mid)">${fmt$(cMTD)}</td>
+          <td class="mono right">${fmt$(cJTD)}</td>
+          <td class="mono right">${fmt$(cProj)}</td>
+          <td class="mono right" style="color:${cVarCol}">${fmt$(cVar)}</td>
+          <td style="color:${cPctCol};font-size:12px;font-weight:700">${cPctDisp!==null?cPctDisp.toFixed(1)+"%":"—"}</td>
+          <td class="mono right" style="color:var(--gold)">${fmt$(cComm)}</td>
+          <td class="mono right" style="color:${cUAP>0?"var(--red)":"inherit"}">${fmt$(cUAP)}</td>
           <td></td><td></td>
         </tr>`;
       }
@@ -1774,8 +2214,22 @@ function renderCosts() {
   }
   return html;
 }
-window.addCostLine = k => { if(!state.costs[k])state.costs[k]=[]; state.costs[k].push({id:uid(),name:"",budget:0,committed:0,actual:0,forecast:0}); saveData(state); render(); };
-window.updCost = (k,id,f,v) => { const l=state.costs[k].find(x=>x.id===id); if(l){l[f]=f==="name"?v:Number(v); saveData(state);} };
+window.addCostLine = k => { if(!state.costs[k])state.costs[k]=[]; state.costs[k].push({id:uid(),name:"",budget:0,mtd:0,actual:0,forecast:0,committed:0,unapprovedAP:0,pctComplete:null}); saveData(state); render(); };
+window.updCost = (k,id,f,v) => {
+  const l=state.costs[k].find(x=>x.id===id);
+  if(l){
+    if(f==="budget" && l.budgetLocked) return; // locked — use unlockBudget() first
+    if(f==="name") l[f]=v;
+    else if(f==="pctComplete") l[f]=(v===null||v===""||v===undefined)?null:(+v||0);
+    else l[f]=Number(v);
+    saveData(state);
+  }
+};
+window.unlockBudget = (k,id) => {
+  if (!confirm('The Estimated value was set from an imported report.\n\nUnlocking it allows manual edits but the value will not update automatically on future imports.\n\nProceed?')) return;
+  const l = state.costs[k] && state.costs[k].find(x=>x.id===id);
+  if (l) { l.budgetLocked = false; saveData(state); render(); }
+};
 window.rmCost = (k,id) => { state.costs[k]=state.costs[k].filter(x=>x.id!==id); saveData(state); render(); };
 
 // --- CHANGE ORDER LOG ---
@@ -1792,10 +2246,11 @@ function renderChangeOrders() {
     ${statCard("Total COs",cos.length,"var(--accent2)")}
   </div>`;
   html += `<div class="table-wrap"><table>
-    <thead><tr><th>CO #</th><th>Date</th><th style="width:22%">Description</th><th>Submitted</th><th>Pending</th><th>Approved</th><th>Cust. CO #</th><th>Approved By</th><th>Cost Line</th><th>Linked PO</th><th style="width:40px"></th></tr></thead><tbody>`;
+    <thead><tr><th>CO #</th><th>Date</th><th style="width:20%">Description</th><th>Submitted</th><th>Pending</th><th>Approved</th><th>Cust. CO #</th><th>Approved By</th><th>Cost Splits</th><th>Linked POs</th><th style="width:40px"></th></tr></thead><tbody>`;
   if (!cos.length) html += `<tr><td colspan="11">${emptyState("—","No change orders yet")}</td></tr>`;
   for (const c of cos) {
-    html += `<tr id="row_${c.id}">
+    const splitOpen = _coSplitPanelId === c.id;
+    html += `<tr id="row_${c.id}" style="${splitOpen ? "background:var(--surface)" : ""}">
       <td>${ecell(c.coNumber,`updArr('changeOrders','${c.id}','coNumber',this.value)`)}</td>
       <td>${ecell(c.dateSubmitted,`updArr('changeOrders','${c.id}','dateSubmitted',this.value)`,"date")}</td>
       <td>${ecell(c.description,`updArr('changeOrders','${c.id}','description',this.value)`,"text","Description…")}</td>
@@ -1804,36 +2259,158 @@ function renderChangeOrders() {
       <td class="mono right">${ecellCurrency(c.amountApproved,`updArr('changeOrders','${c.id}','amountApproved',+this.value||0)`)}</td>
       <td>${ecell(c.custCONumber,`updArr('changeOrders','${c.id}','custCONumber',this.value)`)}</td>
       <td>${ecell(c.approvedBy,`updArr('changeOrders','${c.id}','approvedBy',this.value)`)}</td>
-      <td class="links-cell">${c.costLineId ? coCostLineChip(c) : coCostLineSelect(c)}</td>
-      <td class="links-cell">${c.linkedPOId ? coPOChip(c) : coPOSelect(c)}</td>
+      <td class="links-cell">${coCostSplitsCell(c)}</td>
+      <td class="links-cell">${coPOLinksCell(c)}</td>
       <td><button class="btn-danger" onclick="rmArr('changeOrders','${c.id}')">×</button></td>
-    </tr>`;
+    </tr>
+    ${splitOpen ? renderCOSplitPanel(c) : ""}`;
   }
   html += `</tbody></table></div>`;
   if (openModals.addCO) html += renderAddCOModal();
   return html;
 }
 function renderAddCOModal() {
+  const costOpts = getCostLineOptions();
+  const poOpts = (state.purchaseOrders||[]).map(po => ({ id: po.id, label: `${po.poNumber||"—"} — ${po.vendor||""}` }));
   return `<div class="modal-overlay" onclick="closeModal('addCO')">
     <div class="modal-bg"></div>
-    <div class="modal" style="max-width:500px" onclick="event.stopPropagation()">
+    <div class="modal" style="max-width:580px;max-height:88vh;overflow-y:auto" onclick="event.stopPropagation()">
       <div class="modal-header"><h3>Add Change Order</h3><button class="modal-close" onclick="closeModal('addCO')">✕</button></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
         <div class="field"><label>CO #</label><input id="co_num"></div>
         <div class="field"><label>Date Submitted</label><input type="date" id="co_date"></div>
         <div class="field" style="grid-column:span 2"><label>Description</label><input id="co_desc"></div>
-        <div class="field"><label>Amount Submitted</label><input type="number" id="co_amt" step="any"></div>
+        <div class="field"><label>Amount Submitted ($)</label><input type="number" id="co_amt" step="any" oninput="_coModalUpdateRemaining()"></div>
         <div class="field"><label>Approved By</label><input id="co_by"></div>
+        <div class="field"><label>Customer CO #</label><input id="co_custnum"></div>
       </div>
+
+      <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
+        <div style="font-size:12px;font-weight:700;color:var(--text-lt);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">
+          Cost Type Splits <span style="font-weight:400;font-size:11px" id="co_split_remaining"></span>
+        </div>
+        <div id="co_splits_list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+        <button class="btn-sm-outline" style="font-size:11px" onclick="_coModalAddSplit()">+ Add Cost Split</button>
+      </div>
+
+      <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border)">
+        <div style="font-size:12px;font-weight:700;color:var(--text-lt);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px">
+          Linked PO Payments <span style="font-weight:400;font-size:11px;color:var(--text-faint)">(optional)</span>
+        </div>
+        <div id="co_pos_list" style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px"></div>
+        <button class="btn-sm-outline" style="font-size:11px" onclick="_coModalAddPO()">+ Link a PO</button>
+      </div>
+
       <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:20px">
         <button class="btn btn-secondary" onclick="closeModal('addCO')">Cancel</button>
-        <button class="btn btn-primary" onclick="submitCO()">Add</button>
+        <button class="btn btn-primary" onclick="submitCO()">Add Change Order</button>
       </div>
     </div>
   </div>`;
 }
+
+// ── Add CO modal inline split/PO row builders ──
+let _coModalSplits = [];
+let _coModalPOs = [];
+
+window._coModalAddSplit = function() {
+  const costOpts = getCostLineOptions();
+  const id = "cms_" + Date.now();
+  _coModalSplits.push({ id, costLineId: "", amount: 0, note: "" });
+  const container = document.getElementById("co_splits_list");
+  if (!container) return;
+  const row = document.createElement("div");
+  row.id = id;
+  row.style.cssText = "display:grid;grid-template-columns:1fr 100px 1fr 28px;gap:6px;align-items:center";
+  row.innerHTML = `
+    <select style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--surface)"
+      onchange="(function(el){const s=_coModalSplits.find(x=>x.id==='${id}');if(s)s.costLineId=el.value;_coModalUpdateRemaining();})(this)">
+      <option value="">— Cost Line —</option>
+      ${costOpts.map(o=>`<option value="${o.id}">${esc(o.label)}</option>`).join("")}
+    </select>
+    <input type="number" step="any" placeholder="Amount" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;text-align:right;background:var(--surface)"
+      oninput="(function(el){const s=_coModalSplits.find(x=>x.id==='${id}');if(s)s.amount=+el.value||0;_coModalUpdateRemaining();})(this)">
+    <input type="text" placeholder="Note (optional)" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--surface)"
+      oninput="(function(el){const s=_coModalSplits.find(x=>x.id==='${id}');if(s)s.note=el.value;})(this)">
+    <button class="btn-danger" style="font-size:11px;padding:2px 5px" onclick="_coModalRmSplit('${id}')">×</button>`;
+  container.appendChild(row);
+  _coModalUpdateRemaining();
+};
+
+window._coModalRmSplit = function(id) {
+  _coModalSplits = _coModalSplits.filter(s => s.id !== id);
+  const el = document.getElementById(id); if (el) el.remove();
+  _coModalUpdateRemaining();
+};
+
+window._coModalAddPO = function() {
+  const poOpts = (state.purchaseOrders||[]).map(po => ({ id: po.id, label: `${po.poNumber||"—"} — ${po.vendor||""}` }));
+  const id = "cmp_" + Date.now();
+  _coModalPOs.push({ id, poId: "", amount: 0, note: "" });
+  const container = document.getElementById("co_pos_list");
+  if (!container) return;
+  const row = document.createElement("div");
+  row.id = id;
+  row.style.cssText = "display:grid;grid-template-columns:1fr 100px 1fr 28px;gap:6px;align-items:center";
+  row.innerHTML = `
+    <select style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--surface)"
+      onchange="(function(el){const p=_coModalPOs.find(x=>x.id==='${id}');if(p)p.poId=el.value;})(this)">
+      <option value="">— Select PO —</option>
+      ${poOpts.map(o=>`<option value="${o.id}">${esc(o.label)}</option>`).join("")}
+    </select>
+    <input type="number" step="any" placeholder="Amount" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;text-align:right;background:var(--surface)"
+      oninput="(function(el){const p=_coModalPOs.find(x=>x.id==='${id}');if(p)p.amount=+el.value||0;})(this)">
+    <input type="text" placeholder="Note (optional)" style="font-size:12px;padding:4px 6px;border:1px solid var(--border);border-radius:4px;background:var(--surface)"
+      oninput="(function(el){const p=_coModalPOs.find(x=>x.id==='${id}');if(p)p.note=el.value;})(this)">
+    <button class="btn-danger" style="font-size:11px;padding:2px 5px" onclick="_coModalRmPO('${id}')">×</button>`;
+  container.appendChild(row);
+};
+
+window._coModalRmPO = function(id) {
+  _coModalPOs = _coModalPOs.filter(p => p.id !== id);
+  const el = document.getElementById(id); if (el) el.remove();
+};
+
+window._coModalUpdateRemaining = function() {
+  const total = +document.getElementById("co_amt")?.value || 0;
+  const allocated = _coModalSplits.reduce((s, sp) => s + (+sp.amount||0), 0);
+  const diff = total - allocated;
+  const el = document.getElementById("co_split_remaining");
+  if (!el) return;
+  if (total === 0) { el.textContent = ""; return; }
+  el.style.color = Math.abs(diff) < 0.01 ? "var(--green)" : "var(--gold)";
+  el.textContent = Math.abs(diff) < 0.01
+    ? `✓ ${fmt$(allocated)} allocated`
+    : `${fmt$(allocated)} of ${fmt$(total)} — ${fmt$(Math.abs(diff))} ${diff > 0 ? "unallocated" : "over"}`;
+};
+
 window.submitCO = () => {
-  addToArray("changeOrders",{coNumber:gv("co_num"),dateSubmitted:gv("co_date"),description:gv("co_desc"),amountSubmitted:+gv("co_amt")||0,amountPending:0,amountApproved:0,custCONumber:"",dateApproved:"",approvedBy:gv("co_by")});
+  const amt = +gv("co_amt") || 0;
+  // Build costSplits from modal
+  const costSplits = _coModalSplits
+    .filter(s => s.costLineId)
+    .map(s => ({ id: uid(), costLineId: s.costLineId, amount: s.amount || 0, note: s.note || "" }));
+  // Build linkedPOs from modal
+  const linkedPOs = _coModalPOs
+    .filter(p => p.poId)
+    .map(p => ({ id: uid(), poId: p.poId, amount: p.amount || 0, note: p.note || "" }));
+  addToArray("changeOrders", {
+    coNumber: gv("co_num"),
+    dateSubmitted: gv("co_date"),
+    description: gv("co_desc"),
+    amountSubmitted: amt,
+    amountPending: 0,
+    amountApproved: 0,
+    custCONumber: gv("co_custnum") || "",
+    dateApproved: "",
+    approvedBy: gv("co_by"),
+    costSplits: costSplits,
+    linkedPOs: linkedPOs,
+    costLineId: costSplits.length === 0 ? "" : "",
+    linkedPOId: linkedPOs.length === 0 ? "" : "",
+  });
+  _coModalSplits = [];
+  _coModalPOs = [];
   closeModal("addCO");
 };
 
@@ -1849,7 +2426,7 @@ function renderInvoices() {
     <button class="btn-sm-outline" onclick="openModal('importPOPdf')" style="display:flex;align-items:center;gap:6px">
       <span>📄</span> Import PDF PO
     </button>
-    <span style="font-size:11px;color:var(--text-faint)">Upload an Axis Energy Purchase Agreement PDF to auto-fill fields</span>
+    <span style="font-size:11px;color:var(--text-faint)">Import one or multiple Axis Energy Purchase Agreement PDFs at once</span>
   </div>`;
   html += `<div class="stat-grid" style="grid-template-columns:repeat(3,1fr)">
     ${statCard("Total PO Value",fmt$(tOrig),"var(--accent2)")}
@@ -1881,12 +2458,16 @@ function renderInvoices() {
           <div class="field"><label>PO #</label><input value="${esc(po.poNumber||"")}" onchange="updArr('purchaseOrders','${po.id}','poNumber',this.value)"></div>
           <div class="field"><label>Vendor</label><input value="${esc(po.vendor||"")}" onchange="updArr('purchaseOrders','${po.id}','vendor',this.value)"></div>
           <div class="field"><label>Description</label><input value="${esc(po.description||"")}" onchange="updArr('purchaseOrders','${po.id}','description',this.value)"></div>
-          <div class="field"><label>Original PO $</label><input type="number" step="any" value="${po.originalAmount||""}" onchange="updArr('purchaseOrders','${po.id}','originalAmount',+this.value)"></div>
-          <div class="field"><label>Adjusted PO $</label><input type="number" step="any" value="${po.adjustedAmount||""}" onchange="updArr('purchaseOrders','${po.id}','adjustedAmount',+this.value)"></div>
+          <div class="field"><label>Original PO $</label>${ecellCurrency(po.originalAmount,`updArr('purchaseOrders','${po.id}','originalAmount',+this.value||0)`)}</div>
+          <div class="field"><label>Adjusted PO $</label>${ecellCurrency(po.adjustedAmount,`updArr('purchaseOrders','${po.id}','adjustedAmount',+this.value||0)`)}</div>
           <div class="field"><label>Cost Code</label>${poCostLineSelect(po)}${po.costLineId?`<div style="margin-top:4px">${poCostLineChip(po)}</div>`:""}</div>
         </div>
         ${(()=>{
-          const linkedCOs = (state.changeOrders||[]).filter(c=>c.linkedPOId===po.id);
+          const linkedCOs = (state.changeOrders||[]).filter(c => {
+            if (c.linkedPOId === po.id) return true;
+            if (Array.isArray(c.linkedPOs) && c.linkedPOs.some(l => l.poId === po.id)) return true;
+            return false;
+          });
           if (!linkedCOs.length) return "";
           return `<div style="margin-bottom:12px">
             <div style="font-size:11px;font-weight:700;color:var(--text-lt);text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Linked Change Orders</div>
@@ -1908,7 +2489,7 @@ function renderInvoices() {
             <td>${ecell(inv.dateReceived,`updPOInv('${po.id}','${inv.id}','dateReceived',this.value)`,"date")}</td>
             <td>${ecell(inv.dateApproved,`updPOInv('${po.id}','${inv.id}','dateApproved',this.value)`,"date")}</td>
             <td>${ecell(inv.datePaid,`updPOInv('${po.id}','${inv.id}','datePaid',this.value)`,"date")}</td>
-            <td class="mono right">${ecell(inv.amount,`updPOInv('${po.id}','${inv.id}','amount',+this.value)`,"number")}</td>
+            <td class="mono right">${ecellCurrency(inv.amount,`updPOInv('${po.id}','${inv.id}','amount',+this.value||0)`)}</td>
             <td><button class="btn-danger" onclick="rmPOInv('${po.id}','${inv.id}')">×</button></td>
           </tr>`;
         }
@@ -1996,7 +2577,7 @@ function _loadPdfJs() {
 }
 
 // ── Modal state machine ──────────────────────────────────────────────────
-// phases: idle | loading | reading | not_axis | error | preview
+// phases: idle | loading | reading | not_axis | error | preview | batch_results
 let _poPdf = { phase: "idle", fileName: "", parsed: null, errorMsg: "" };
 
 function _poPdfSetPhase(phase, extra) {
@@ -2018,10 +2599,10 @@ function _renderPoPdfModalBody() {
       ${busy?"":"ondragleave=\"this.style.borderColor='var(--border-dk)';this.style.background='var(--surface)'\""}
       ${busy?"":"ondrop=\"event.preventDefault();this.style.borderColor='var(--border-dk)';this.style.background='var(--surface)';poPdfDrop(event.dataTransfer.files)\""}>
       <div style="font-size:42px;margin-bottom:14px;${busy?"display:inline-block;animation:spin 1s linear infinite":""}">&#128196;</div>
-      <div style="font-size:15px;font-weight:600;margin-bottom:6px">${busy ? "Loading PDF reader…" : "Drop an Axis Energy PO PDF here"}</div>
-      <div style="font-size:13px;color:var(--text-lt);margin-bottom:20px">${busy ? "One moment please" : "Content is inspected — filename doesn't matter"}</div>
+      <div style="font-size:15px;font-weight:600;margin-bottom:6px">${busy ? "Loading PDF reader…" : "Drop one or more Axis Energy PO PDFs here"}</div>
+      <div style="font-size:13px;color:var(--text-lt);margin-bottom:20px">${busy ? "One moment please" : "Drop multiple files to batch import — filenames don't matter"}</div>
       ${busy ? "" : `<button class="btn btn-secondary btn-sm" onclick="document.getElementById('po-pdf-file-in').click()">Browse for PDF</button>
-      <input type="file" id="po-pdf-file-in" accept=".pdf,application/pdf" style="display:none" onchange="poPdfDrop(this.files)">`}
+      <input type="file" id="po-pdf-file-in" accept=".pdf,application/pdf" multiple style="display:none" onchange="poPdfDrop(this.files)">`}
     </div>`;
   } else if (s.phase === "reading") {
     html = `<div style="text-align:center;padding:48px 24px">
@@ -2087,6 +2668,44 @@ function _renderPoPdfModalBody() {
     </div>`;
   }
 
+  // ── batch_results phase ────────────────────────────────────────────────
+  if (s.phase === "batch_results") {
+    const results = s.batchResults || [];
+    const okCount   = results.filter(r => r.status === "ok").length;
+    const updCount  = results.filter(r => r.status === "updated").length;
+    const skipCount = results.filter(r => r.status === "skip").length;
+    const errCount  = results.filter(r => r.status === "error").length;
+    const rows = results.map(r => {
+      const icon  = r.status === "ok" ? "&#10003;" : r.status === "updated" ? "&#8635;" : r.status === "skip" ? "&mdash;" : "&#10060;";
+      const color = r.status === "ok" ? "var(--green)" : r.status === "updated" ? "var(--accent2)" : r.status === "skip" ? "var(--text-lt)" : "var(--red)";
+      return `<tr style="border-top:1px solid var(--border)">
+        <td style="padding:5px 10px;font-size:13px;color:${color};font-weight:700;width:28px">${icon}</td>
+        <td style="padding:5px 10px;font-size:12px;color:var(--text-lt)">${esc(r.fileName)}</td>
+        <td style="padding:5px 10px;font-size:12px">${esc(r.detail)}</td>
+      </tr>`;
+    }).join("");
+    html = `<div style="background:var(--surface);border-radius:10px;padding:14px 16px;margin-bottom:14px">
+      <div style="font-size:14px;font-weight:700;margin-bottom:12px">
+        Batch Import Complete &mdash;
+        <span style="color:var(--green)">${okCount} added</span>${updCount ? `, <span style="color:var(--accent2)">${updCount} updated</span>` : ""}${skipCount ? `, ${skipCount} skipped` : ""}${errCount ? `, <span style="color:var(--red)">${errCount} error(s)</span>` : ""}
+      </div>
+      <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;max-height:280px;overflow-y:auto">
+        <table style="width:100%;border-collapse:collapse">
+          <thead><tr style="background:var(--surface)">
+            <th style="padding:5px 10px;text-align:left;font-size:10px;font-weight:700;color:var(--text-lt);text-transform:uppercase"></th>
+            <th style="padding:5px 10px;text-align:left;font-size:10px;font-weight:700;color:var(--text-lt);text-transform:uppercase">File</th>
+            <th style="padding:5px 10px;text-align:left;font-size:10px;font-weight:700;color:var(--text-lt);text-transform:uppercase">Result</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </div>
+    <div style="display:flex;justify-content:flex-end;gap:10px">
+      <button class="btn btn-secondary btn-sm" onclick="_poPdfSetPhase('idle',{fileName:'',parsed:null,batchResults:[]})">&#8592; Import More</button>
+      <button class="btn btn-primary btn-sm" onclick="closeModal('importPOPdf');render()">&#10003; Done</button>
+    </div>`;
+  }
+
   host.innerHTML = html;
 }
 
@@ -2107,24 +2726,90 @@ function renderImportPOModal() {
 // ── File handler (drag-drop or browse) ──────────────────────────────────
 window.poPdfDrop = async function(files) {
   if (!files || !files[0]) return;
-  const file = files[0];
-  const ext  = file.name.toLowerCase();
-  if (!ext.endsWith(".pdf") && file.type !== "application/pdf") {
-    _poPdfSetPhase("error", { errorMsg: "Please select a PDF file (.pdf)." }); return;
+
+  // ── Single file → preview flow (allows editing before importing) ──
+  if (files.length === 1) {
+    const file = files[0];
+    const ext  = file.name.toLowerCase();
+    if (!ext.endsWith(".pdf") && file.type !== "application/pdf") {
+      _poPdfSetPhase("error", { errorMsg: "Please select a PDF file (.pdf)." }); return;
+    }
+    _poPdfSetPhase("loading", { fileName: file.name });
+    try {
+      if (!_pdfJsReady) await _loadPdfJs();
+      _poPdfSetPhase("reading", { fileName: file.name });
+      const buf    = await file.arrayBuffer();
+      const text   = await _pdfExtractAllText(buf);
+      const parsed = _parseAxisPO(text);
+      if (!parsed) { _poPdfSetPhase("not_axis", { fileName: file.name }); return; }
+      _poPdfSetPhase("preview", { fileName: file.name, parsed });
+    } catch(err) {
+      _poPdfSetPhase("error", { errorMsg: err.message || String(err) });
+    }
+    return;
   }
 
-  _poPdfSetPhase("loading", { fileName: file.name });
-  try {
-    if (!_pdfJsReady) await _loadPdfJs();
-    _poPdfSetPhase("reading", { fileName: file.name });
-    const buf   = await file.arrayBuffer();
-    const text  = await _pdfExtractAllText(buf);
-    const parsed = _parseAxisPO(text);
-    if (!parsed) { _poPdfSetPhase("not_axis", { fileName: file.name }); return; }
-    _poPdfSetPhase("preview", { fileName: file.name, parsed });
-  } catch(err) {
-    _poPdfSetPhase("error", { errorMsg: err.message || String(err) });
+  // ── Multiple files → batch auto-import (no per-file preview) ──
+  const pdfs = Array.from(files).filter(f =>
+    f.name.toLowerCase().endsWith(".pdf") || f.type === "application/pdf"
+  );
+  if (!pdfs.length) { _poPdfSetPhase("error", { errorMsg: "No PDF files found in selection." }); return; }
+
+  _poPdfSetPhase("loading", { fileName: `Loading PDF reader…` });
+  try { if (!_pdfJsReady) await _loadPdfJs(); } catch(e) {
+    _poPdfSetPhase("error", { errorMsg: "Failed to load PDF reader: " + e.message }); return;
   }
+
+  const batchResults = [];
+  for (let i = 0; i < pdfs.length; i++) {
+    const file = pdfs[i];
+    _poPdfSetPhase("reading", { fileName: `(${i + 1}/${pdfs.length}) ${file.name}` });
+    try {
+      const buf    = await file.arrayBuffer();
+      const text   = await _pdfExtractAllText(buf);
+      const parsed = _parseAxisPO(text);
+      if (!parsed) {
+        batchResults.push({ fileName: file.name, status: "skip", detail: "Not an Axis Energy PO — skipped" });
+        continue;
+      }
+      // Auto-import: update existing or push new
+      const existing = (state.purchaseOrders || []).find(p => p.poNumber === parsed.poNumber && parsed.poNumber);
+      if (existing) {
+        Object.assign(existing, {
+          vendor:         parsed.vendor        || existing.vendor,
+          description:    parsed.description   || existing.description,
+          originalAmount: parsed.amount        || existing.originalAmount,
+          adjustedAmount: parsed.amount        || existing.adjustedAmount,
+          orderDate:      parsed.orderDate     || existing.orderDate,
+          jobNumber:      parsed.jobNumber     || existing.jobNumber,
+          shipTo:         parsed.shipTo        || existing.shipTo,
+          sourceFile: file.name, importedVia: "axis-pdf",
+        });
+        batchResults.push({ fileName: file.name, status: "updated",
+          detail: `PO ${parsed.poNumber} — ${parsed.vendor} — ${fmt$(parsed.amount)}` });
+      } else {
+        const newPO = {
+          id: uid(), poNumber: parsed.poNumber, vendor: parsed.vendor,
+          description: parsed.description, originalAmount: parsed.amount,
+          adjustedAmount: parsed.amount, orderDate: parsed.orderDate,
+          jobNumber: parsed.jobNumber, shipTo: parsed.shipTo,
+          orderedBy: "", invoices: [], changeOrders: [],
+          sourceFile: file.name, importedVia: "axis-pdf",
+        };
+        if (!state.purchaseOrders) state.purchaseOrders = [];
+        state.purchaseOrders.push(newPO);
+        logActivity("import", "import", "PDF Batch Import",
+          `PO ${parsed.poNumber} — ${parsed.vendor} — ${fmt$(parsed.amount)}`);
+        batchResults.push({ fileName: file.name, status: "ok",
+          detail: `PO ${parsed.poNumber} — ${parsed.vendor} — ${fmt$(parsed.amount)}` });
+      }
+    } catch(err) {
+      batchResults.push({ fileName: file.name, status: "error", detail: err.message || "Parse error" });
+    }
+  }
+
+  saveData(state);
+  _poPdfSetPhase("batch_results", { batchResults });
 };
 
 // ── PDF.js text extraction (all pages, y-grouped into lines) ─────────────
@@ -2234,7 +2919,11 @@ function _parseAxisPO(text) {
     const iM = l.match(/^(\d+)\s+(.+)/);
     if (iM && parseInt(iM[1]) === nextNum) {
       if (cur) lineItems.push(cur);
-      cur = { description: iM[2].trim(), um: "", total: 0 };
+      // Strip trailing UM/price columns that PDF.js may join onto the description line
+      // e.g. "Item Name LS 0.000 $0.000 $1,234.56" → "Item Name"
+      let rawDesc = iM[2].trim();
+      rawDesc = rawDesc.replace(/\s+[A-Z]{1,4}\s+[\d.]+\s+\$[\d,.]+\s+\$[\d,.]+\s*$/i, "").trim();
+      cur = { description: rawDesc, um: "", total: 0 };
       nextNum++; inPhase = false; continue;
     }
   }
@@ -2526,7 +3215,7 @@ function renderSubcontractors() {
   html += secHeader("Subcontractor Scope Tracker", subs.length, "openModal('addSub2')", "+ Subcontractor");
 
   // Stats
-  const quoted = subs.filter(s=>s.quote).length;
+  const quoted = subs.filter(s=>s.quoteAmount).length;
   const selected = subs.filter(s=>s.selected).length;
   const awarded = subs.filter(s=>s.awarded).length;
   html += `<div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
@@ -2560,11 +3249,11 @@ function renderSubcontractors() {
         <td>${ecell(s.contactDate,`updArr('subcontractors','${s.id}','contactDate',this.value)`,"date")}</td>
         <td>${ecell(s.rfpSent,`updArr('subcontractors','${s.id}','rfpSent',this.value)`,"date")}</td>
         <td>${ecell(s.pricingReceived,`updArr('subcontractors','${s.id}','pricingReceived',this.value)`,"date")}</td>
-        <td class="mono right">${ecell(s.quote,`updArr('subcontractors','${s.id}','quote',this.value)`,"text")}</td>
+        <td class="mono right">${ecellCurrency(s.quoteAmount,`updArr('subcontractors','${s.id}','quoteAmount',+this.value||0)`)}</td>
         <td style="text-align:center"><input type="checkbox" ${s.selected?"checked":""} onchange="updArr('subcontractors','${s.id}','selected',this.checked)"></td>
         <td style="text-align:center"><input type="checkbox" ${s.awarded?"checked":""} onchange="updArr('subcontractors','${s.id}','awarded',this.checked)"></td>
         <td class="links-cell">${s.costLineId ? subCostLineChip(s) : subCostLineSelect(s)}</td>
-        <td class="links-cell">${s.linkedPOId ? subPOChip(s) : (s.awarded&&s.quote ? `<button class="btn-sm-outline" style="white-space:nowrap;font-size:11px;padding:3px 8px" onclick="convertSubToPO('${s.id}')">→ Create PO</button>` : "")}</td>
+        <td class="links-cell">${s.linkedPOId ? subPOChip(s) : (s.awarded&&s.quoteAmount ? `<button class="btn-sm-outline" style="white-space:nowrap;font-size:11px;padding:3px 8px" onclick="convertSubToPO('${s.id}')">→ Create PO</button>` : "")}</td>
         <td>${ecell(s.notes,`updArr('subcontractors','${s.id}','notes',this.value)`,"text","Notes…")}</td>
         <td><button class="btn-danger" onclick="rmArr('subcontractors','${s.id}')">×</button></td>
       </tr>`;
@@ -3370,7 +4059,7 @@ function importVistaPOFromText(text, poNumber, filename) {
   const description = descMatch ? descMatch[1].trim() : `PO ${poNumber}`;
 
   // Check if this PO already exists
-  const existingPO = state.purchaseOrders.find(po => String(po.poNumber||"") === String(poNumber));
+  const existingPO = state.purchaseOrders.find(po => po.number === poNumber || po.number === String(poNumber));
   if (existingPO) {
     // Update amount if changed
     if (amount && Math.abs(existingPO.originalAmount - amount) > 1) {
@@ -3383,7 +4072,7 @@ function importVistaPOFromText(text, poNumber, filename) {
   // Create new PO
   const newPO = {
     id: uid(),
-    poNumber: String(poNumber),
+    number: String(poNumber),
     vendor: vendor,
     description: description,
     originalAmount: amount,
@@ -3519,7 +4208,7 @@ function tryViewpointImport(wb, nameLower, originalName) {
       (topText.includes("contract costs to date") && topText.includes("estimated"))) {
     return vpImportJobCostMain(rows);
   }
-  if (topText.includes("jc detail") || topText.includes("job cost detail") || (nameLower.includes("job_cost_detail") && !nameLower.includes("main"))) {
+  if (topText.includes("jc detail") || (nameLower.includes("job_cost_detail") && !nameLower.includes("main"))) {
     return vpImportJobCostDetail(rows);
   }
   if (topText.includes("contract control sheet") || topText.includes("pco") && topText.includes("aco") && topText.includes("approved")) {
@@ -3575,27 +4264,6 @@ function vpCellNear(rows, r, c, offset=1) {
 
 function vpNum(v) { return parseFloat(String(v).replace(/[$,]/g,'')) || 0; }
 
-function vpText(row) {
-  return row.map(v=>String(v||"").trim()).filter(Boolean).join(" ");
-}
-
-function vpFindCell(row, matcher) {
-  for (let i=0; i<row.length; i++) {
-    const cell = String(row[i]||"");
-    if (matcher(cell)) return { idx:i, value:cell };
-  }
-  return null;
-}
-
-function vpFindNumberNear(row, idx, window=6) {
-  let best = 0;
-  for (let c=Math.max(0, idx+1); c<Math.min(row.length, idx+1+window); c++) {
-    const n = vpNum(row[c]);
-    if (n !== 0) { best = n; break; }
-  }
-  return best;
-}
-
 // ─────────────────────────────────────────────────────────
 // 1. JOB COST DETAIL MAIN PAGE → Cost Breakdown + Project Overview
 // ─────────────────────────────────────────────────────────
@@ -3633,7 +4301,7 @@ function vpImportJobCostMain(rows) {
   }
 
   // Extract contract + billing amounts — scan entire header block
-  // Siemens JC Main Page has a "Contract Progress" panel with these labels
+  // Viewpoint Vista JC Contract Cost Report has a "Contract Progress" panel with these labels
   for (let r = 0; r < Math.min(rows.length, 60); r++) {
     const row  = rows[r];
     const flat = row.map(v=>String(v)).join(" ");
@@ -3680,7 +4348,7 @@ function vpImportJobCostMain(rows) {
 
     // Found header row — extract costs from following rows
     // Determine column positions
-    let colEst=-1, colMTD=-1, colJTD=-1, colProj=-1, colVar=-1, colCommit=-1;
+    let colEst=-1, colMTD=-1, colJTD=-1, colProj=-1, colVar=-1, colCommit=-1, colUnapAP=-1;
     row.forEach((v,i)=>{
       const s=String(v).toLowerCase();
       if (s.includes("estimated")) colEst=i;
@@ -3688,22 +4356,18 @@ function vpImportJobCostMain(rows) {
       else if (s.includes("job to date") || s.includes("jtd")) colJTD=i;
       else if (s.includes("projected")) colProj=i;
       else if (s.includes("variance")) colVar=i;
+      else if (s.includes("unapproved") || s.includes("unap")) colUnapAP=i;
       else if (s.includes("committed") || s.includes("open")) colCommit=i;
     });
     if (colEst<0 || colJTD<0) continue;
 
-    // Siemens/Viewpoint files place the cost type label at col 7.
-    // Fall back to cols 0-2 for other layouts.
-    // Also ensure absolute column fallbacks if dynamic detection missed them.
-    if (colEst    < 0) colEst    = 19;
-    if (colJTD    < 0) colJTD    = 31;
-    if (colProj   < 0) colProj   = 39;
-    if (colCommit < 0) colCommit = 57;
+    // Viewpoint Vista places the cost type label at col 7 in the JC Contract Cost Report.
+    // Fall back to cols 8, 0, 1, 2 for other layouts.
 
     // Read cost rows until totals line
     for (let dr=r+1; dr<Math.min(r+25, rows.length); dr++) {
       const drow = rows[dr];
-      // Label lives at col 7 in Siemens files; check broader range as fallback
+      // Label lives at col 7 in Viewpoint Vista layout; check broader range as fallback
       const rawLabel = String(drow[7]||drow[8]||drow[0]||drow[1]||drow[2]||"").trim();
       const label = rawLabel.toLowerCase();
       if (!label || label.includes("total") || label.includes("recap")) break;
@@ -3717,10 +4381,14 @@ function vpImportJobCostMain(rows) {
 
       // Find the clean label (strip leading numbers like "1    Labor")
       const cleanLabel = rawLabel.replace(/^\d+\s+/,"").trim();
-      const budget    = colEst>=0   ? vpNum(drow[colEst])  : 0;
-      const actual    = colJTD>=0   ? vpNum(drow[colJTD])  : 0;
-      const forecast  = colProj>=0  ? vpNum(drow[colProj]) : actual;
-      const committed = colCommit>=0 ? vpNum(drow[colCommit]) : 0;
+      const budget      = colEst>=0    ? vpNum(drow[colEst])    : 0;
+      const mtd         = colMTD>=0    ? vpNum(drow[colMTD])    : 0;
+      const actual      = colJTD>=0    ? vpNum(drow[colJTD])    : 0;
+      const forecast    = colProj>=0   ? vpNum(drow[colProj])   : actual;
+      const committed   = colCommit>=0 ? vpNum(drow[colCommit]) : 0;
+      const unapprovedAP= colUnapAP>=0 ? vpNum(drow[colUnapAP]) : 0;
+      // % Complete: JTD / Estimated if both present, else null
+      const pctComplete = (budget > 0 && actual > 0) ? Math.round((actual / budget) * 1000) / 10 : null;
 
       if (!budget && !actual && !forecast) continue;
 
@@ -3728,14 +4396,19 @@ function vpImportJobCostMain(rows) {
       if (!state.costs[catKey]) state.costs[catKey] = [];
       const existing = state.costs[catKey].find(l=>l.name===cleanLabel || l.name==="Viewpoint Import");
       if (existing) {
-        existing.budget    = budget    || existing.budget;
-        existing.actual    = actual    || existing.actual;
-        existing.forecast  = forecast  || existing.forecast;
-        existing.committed = committed || existing.committed;
+        existing.budget       = budget       || existing.budget;
+        existing.budgetLocked = true;  // re-lock on every import
+        existing.mtd          = mtd          || existing.mtd;
+        existing.actual       = actual       || existing.actual;
+        existing.forecast     = forecast     || existing.forecast;
+        existing.committed    = committed    || existing.committed;
+        existing.unapprovedAP = unapprovedAP || existing.unapprovedAP;
+        if (pctComplete !== null) existing.pctComplete = pctComplete;
       } else {
         state.costs[catKey].push({
           id: uid(), name: cleanLabel||catKey,
-          budget, committed, actual, forecast
+          budget, budgetLocked: true,
+          mtd, actual, forecast, committed, unapprovedAP, pctComplete
         });
       }
     }
@@ -3886,78 +4559,66 @@ function importJobSetupBreakdown(rows) {
 
 // ─────────────────────────────────────────────────────────
 // 3. CONTRACT CONTROL SHEET → Change Orders
+// Viewpoint Vista layout:
+//   - CO header row: col 0=date, col 5=description, col 9=PCO, col 12=ACO, col 17=Total CO Amount
+//   - Phase detail rows: same PCO/ACO, col 17 empty, col 38=phase cost
+//   - Subtotal row: col 5="Subtotal for OTHER", col 12=ACO, col 38=total cost for CO
+// Strategy: use col 17 from the header row for single-phase COs;
+//           use col 38 from subtotal rows for multi-phase COs where col 17 is empty.
 // ─────────────────────────────────────────────────────────
 function vpImportContract(rows) {
+  // ── Multi-phase CO parser ──
+  // Viewpoint Contract Control Sheet has 3 row types per CO:
+  //   1. Header row:   col5=description, col9=PCO, col12=ACO, col13=Cd, col0=date, col3=apprDate
+  //                    col17 MAY be blank (multi-phase) or have full amount (single-phase)
+  //   2. Phase rows:   same PCO/ACO, col17=phase amount, col38=phase cost — accumulate
+  //   3. Subtotal row: col5="Subtotal for OTHER:", col38=total CO cost — finalizes amount
   const cos = [];
-  const coMap = {};
-  let currentKey = null;
-  let phaseCumulative = 0;
+  const coMap = {}; // key(aco||pco) → CO object
+  let _currentKey = null;
+  let _phaseCumulative = 0;  // accumulated col17 from phase rows
+  let _subtotalCost = 0;     // col38 from subtotal row
 
-  // Detect columns from the header row so we are not tied to a single export layout
   let foundHeader = false;
-  let idx = { date:0, approvedDate:3, desc:5, pco:9, aco:12, cd:13, amount:17, subtotal:38 };
-
-  let bestHeader = -1;
-  let bestScore = 0;
-  for (let r = 0; r < Math.min(rows.length, 160); r++) {
-    const flat = vpText(rows[r]).toLowerCase();
-    let score = 0;
-    if (flat.includes("description")) score++;
-    if (flat.includes("pco") || flat.includes("proposal")) score++;
-    if (flat.includes("aco") || flat.includes("approved")) score++;
-    if (flat.includes("date")) score++;
-    if (flat.includes("amount") || flat.includes("cost")) score++;
-    if (score > bestScore) { bestScore = score; bestHeader = r; }
-  }
-  if (bestHeader >= 0 && bestScore >= 3) {
-    foundHeader = true;
-    rows[bestHeader].forEach((v,c)=>{
-      const h = String(v||"").toLowerCase();
-      if (h.includes("description")) idx.desc = c;
-      else if (h === "pco" || h.includes("pco #") || h.includes("proposal")) idx.pco = c;
-      else if (h === "aco" || h.includes("aco #") || h.includes("approved chg")) idx.aco = c;
-      else if (h === "cd" || h.includes("code")) idx.cd = c;
-      else if (h.includes("date") && h.includes("approved")) idx.approvedDate = c;
-      else if (h.includes("date") && !h.includes("approved")) idx.date = c;
-      else if (h.includes("amount") && (h.includes("co") || h.includes("change"))) idx.amount = c;
-      else if (h.includes("cost") || h.includes("subtotal")) idx.subtotal = c;
-    });
-  } else {
-    foundHeader = true; // fallback to legacy defaults
-  }
-
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
-    const flat = vpText(row).toLowerCase();
+    const flat = row.map(v=>String(v)).join(" ").toLowerCase();
 
+    // Find data header row
     if (!foundHeader) {
+      if (flat.includes("description") && (flat.includes("pco") || flat.includes("approved"))) {
+        foundHeader = true;
+      }
       continue;
     }
 
-    if (flat.includes("codes:") || flat.includes("page ")) continue;
+    // Skip legend / page-break rows
+    if (flat.includes("codes:") || flat.includes("page ") || flat.includes("approved:") && flat.includes("pending:")) continue;
 
-    const descCell = String(row[idx.desc]||"").trim();
-    const pcoRaw0  = String(row[idx.pco]||"").trim().replace(/\s+/g,"");
-    const acoRaw0  = String(row[idx.aco]||"").trim().replace(/\s+/g,"");
-    const pcoMatch = flat.match(/\bPCO[-\s]*#?\s*([A-Z0-9-]{1,})/i);
-    const acoMatch = flat.match(/\bACO[-\s]*#?\s*([A-Z0-9-]{1,})/i);
-    const pcoRaw   = pcoRaw0 || (pcoMatch ? pcoMatch[1] : "");
-    const acoRaw   = acoRaw0 || (acoMatch ? acoMatch[1] : "");
-    const cdRaw    = String(row[idx.cd]||"").trim();
-    const dateRaw  = vpDate(row[idx.date]);
-    const apprRaw  = vpDate(row[idx.approvedDate]);
-    const amt      = vpNum(row[idx.amount]);
-    const subAmt   = vpNum(row[idx.subtotal]);
+    const descCell = String(row[5]||"").trim();
+    const pcoRaw   = String(row[9]||"").trim().replace(/\s+/g,"");
+    const acoRaw   = String(row[12]||"").trim().replace(/\s+/g,"");
+    const cdRaw    = String(row[13]||"").trim();
+    const dateRaw  = vpDate(row[0]);
+    const apprRaw  = vpDate(row[3]);
+    const col17amt = vpNum(row[17]);
+    const col38amt = vpNum(row[38]);
 
-    if (!descCell && !pcoRaw && !acoRaw && !amt && !subAmt) continue;
-    if (flat.includes("grand total")) continue;
+    // Skip completely empty rows
+    if (!descCell && !pcoRaw && !acoRaw && !col17amt && !col38amt) continue;
+    // Skip grand totals row
+    if (flat.includes("grand total") || (flat.includes("total") && !pcoRaw && !acoRaw && !descCell)) continue;
 
-    if (descCell.toLowerCase().startsWith("subtotal") && currentKey) {
-      const co = coMap[currentKey];
-      if (co && co.amountSubmitted === 0) {
-        co.amountSubmitted = phaseCumulative || subAmt || 0;
-      }
+    // ── Subtotal row ──
+    // e.g. "Subtotal for OTHER:", col38 = total cost for this CO
+    if (descCell.toLowerCase().startsWith("subtotal") && _currentKey) {
+      const co = coMap[_currentKey];
       if (co) {
+        // Finalize amount: prefer accumulated phase col17, else col38 subtotal cost
+        if (co.amountSubmitted === 0) {
+          co.amountSubmitted = _phaseCumulative || col38amt || 0;
+        }
+        // Set approved/pending based on finalized amount
         if (co._cdRaw === "A" || (co.dateApproved && co._cdRaw !== "P")) {
           co.amountApproved = Math.abs(co.amountSubmitted);
           co.amountPending = 0;
@@ -3966,61 +4627,86 @@ function vpImportContract(rows) {
           co.amountApproved = 0;
         }
       }
-      currentKey = null;
-      phaseCumulative = 0;
+      _currentKey = null;
+      _phaseCumulative = 0;
+      _subtotalCost = 0;
       continue;
     }
 
-    const key = acoRaw || pcoRaw;
+    const pco = pcoRaw;
+    const aco = acoRaw;
+    const key = aco || pco;
     if (!key || key === "0") continue;
+
+    // Skip "Original Contract" base row
     if (descCell === "Original Contract" || descCell === "Base Contract") continue;
 
     if (coMap[key]) {
-      if (amt) phaseCumulative += amt;
-      currentKey = key;
-      continue;
+      // ── Phase detail row for existing CO ──
+      // Accumulate col17 phase amounts; also track col38
+      if (col17amt) _phaseCumulative += col17amt;
+      _currentKey = key;
+    } else {
+      // ── New CO header row ──
+      // Require at minimum a description or a non-zero amount
+      if (!descCell && !col17amt && !col38amt) continue;
+
+      _currentKey = key;
+      _phaseCumulative = col17amt || 0;
+      _subtotalCost = 0;
+
+      const co = {
+        id: uid(),
+        coNumber: aco || pco,
+        dateSubmitted: dateRaw,
+        dateApproved: apprRaw,
+        description: descCell,
+        // amountSubmitted finalized on subtotal row (or now if col17 is set)
+        amountSubmitted: col17amt || 0,
+        amountPending:   0,
+        amountApproved:  0,
+        custCONumber: pco,
+        approvedBy: "",
+        _cdRaw: cdRaw   // temp field for status resolution
+      };
+
+      // For single-phase COs col17 is set on header row — no subtotal row follows
+      // Resolve immediately if col17 is present
+      if (col17amt) {
+        const isApproved = cdRaw === "A" || (apprRaw && cdRaw !== "P") || (!cdRaw && apprRaw);
+        const isRejected = cdRaw === "V" || cdRaw === "D";
+        if (isApproved) {
+          co.amountApproved = Math.abs(col17amt);
+        } else if (!isRejected) {
+          co.amountPending = Math.abs(col17amt);
+        }
+      }
+
+      coMap[key] = co;
+      cos.push(co);
     }
-
-    currentKey = key;
-    phaseCumulative = amt || 0;
-
-    const co = {
-      id: uid(),
-      coNumber: acoRaw || pcoRaw,
-      dateSubmitted: dateRaw,
-      dateApproved: apprRaw,
-      description: descCell,
-      amountSubmitted: amt || 0,
-      amountPending: 0,
-      amountApproved: 0,
-      custCONumber: pcoRaw,
-      approvedBy: "",
-      _cdRaw: cdRaw
-    };
-
-    if (amt) {
-      const isApproved = cdRaw === "A" || (apprRaw && cdRaw !== "P") || (!cdRaw && apprRaw);
-      const isRejected = cdRaw === "V" || cdRaw === "D";
-      if (isApproved) co.amountApproved = Math.abs(amt);
-      else if (!isRejected) co.amountPending = Math.abs(amt);
-    }
-
-    coMap[key] = co;
-    cos.push(co);
   }
 
-  if (currentKey && coMap[currentKey]) {
-    const co = coMap[currentKey];
-    if (co.amountSubmitted === 0 && phaseCumulative) co.amountSubmitted = phaseCumulative;
+  // Handle any CO that never got a subtotal row (single-phase, file truncated, etc.)
+  if (_currentKey && coMap[_currentKey]) {
+    const co = coMap[_currentKey];
+    if (co.amountSubmitted === 0 && _phaseCumulative) {
+      co.amountSubmitted = _phaseCumulative;
+    }
   }
 
+  // Clean up temp fields and merge into state
   let created = 0, updated = 0;
   for (const co of cos) {
     delete co._cdRaw;
+    // skip COs that ended up with zero amounts AND no description (phantom rows)
     if (!co.description && !co.amountSubmitted) continue;
+
     const exists = state.changeOrders.find(c => c.coNumber === co.coNumber);
-    if (!exists) { state.changeOrders.push(co); created++; }
-    else {
+    if (!exists) {
+      state.changeOrders.push(co);
+      created++;
+    } else {
       exists.description     = exists.description     || co.description;
       exists.amountSubmitted = exists.amountSubmitted || co.amountSubmitted;
       exists.amountApproved  = exists.amountApproved  || co.amountApproved;
@@ -4029,11 +4715,10 @@ function vpImportContract(rows) {
     }
   }
 
-  const approved = cos.filter(c=>c.amountApproved!==0).length;
-  const pending  = cos.filter(c=>c.amountPending>0).length;
+  const approved = cos.filter(c=>c.amountApproved>0||c.amountApproved<0).length;
+  const pending  = cos.filter(c=>c.amountPending >0).length;
   return `Contract Control Sheet — ${created} COs imported (${approved} approved, ${pending} pending)`;
 }
-
 
 // ─────────────────────────────────────────────────────────
 // 4. OPEN COMMITMENTS → Purchase Orders
@@ -4044,28 +4729,21 @@ function vpImportCommitments(rows) {
 
   for (let r=0; r<rows.length; r++) {
     const row = rows[r];
-    const flat = vpText(row);
+    // Detect PO header row: "PO  24-003092   Description"
+    const cell1 = String(row[1]||"").trim();
+    if (cell1.startsWith("PO ") || cell1.startsWith("PO\t")) {
+      // Parse PO number and description from cell1: "PO  24-003092   Description text"
+      const parts = cell1.replace(/\s+/g," ").split(" ");
+      const poNum = parts[1] || "";
+      const poDesc = parts.slice(2).join(" ").trim();
 
-    // Detect PO header row by content, not fixed column offsets
-    const poHeader = flat.match(/\bPO\s*[:#-]?\s*([A-Z0-9-]{4,})\b/i);
-    if (poHeader && !/total\s+for\s+po/i.test(flat)) {
-      const poNum = poHeader[1] || "";
-      const poStart = poHeader.index ?? 0;
-      const poDesc = flat.slice(poStart + poHeader[0].length).trim();
+      // Vendor is at col 26: "Vendor: RENTALL CONSTRUCTION, INC.  (315)"
+      const vendorRaw = String(row[26]||"").trim();
+      const vendor = vendorRaw.replace(/Vendor:\s*/i,"").split("(")[0].trim();
 
-      const vendorCell = vpFindCell(row, c=>/^\s*vendor\s*:/i.test(c) || /^\s*vendor\b/i.test(c));
-      let vendor = "";
-      if (vendorCell) {
-        vendor = String(vpCellNear(rows, r, vendorCell.idx, 4)).replace(/Vendor:\s*/i,"").split("(")[0].trim();
-        if (!vendor || /^\(?\d+\)?$/.test(vendor)) {
-          vendor = String(vendorCell.value).replace(/Vendor:\s*/i,"").split("(")[0].trim();
-        }
-      }
-
-      const orderDateCell = vpFindCell(row, c=>/order\s*date\s*:/i.test(c));
-      const orderedByCell = vpFindCell(row, c=>/ordered\s*by\s*:/i.test(c));
-      const orderDate = orderDateCell ? vpDate(vpCellNear(rows, r, orderDateCell.idx, 3)) : "";
-      const orderedBy = orderedByCell ? vpCellNear(rows, r, orderedByCell.idx, 3) : "";
+      // Order date col 16, ordered-by col 18
+      const orderDate = vpDate(row[16]);
+      const orderedBy = String(row[18]||"").trim();
 
       currentPO = {
         id: uid(),
@@ -4081,20 +4759,14 @@ function vpImportCommitments(rows) {
       pos.push(currentPO);
     }
 
-    // Total for PO row
-    if (currentPO && /total\s+for\s+po/i.test(flat) && !/total\s+for\s+po'?s/i.test(flat)) {
-      const totalCostsCell = vpFindCell(row, c=>/total\s+costs?/i.test(c));
-      const totalInvoicedCell = vpFindCell(row, c=>/total\s+invoiced/i.test(c));
-
-      let totalOrdered = totalCostsCell ? vpFindNumberNear(row, totalCostsCell.idx, 8) : 0;
-      let totalInvoiced = totalInvoicedCell ? vpFindNumberNear(row, totalInvoicedCell.idx, 8) : 0;
-
-      if (!totalOrdered && !totalInvoiced) {
-        const nums = row.map(v=>vpNum(v)).filter(n=>n>0);
-        totalOrdered = nums[0] || 0;
-        totalInvoiced = nums[1] || 0;
-      }
-
+    // Total for PO row: "Total for PO:  24-003092:"
+    // Guard: skip the grand "Total for PO's" summary row (note the apostrophe)
+    const cell12 = String(row[12]||"").trim();
+    if (currentPO && cell12.includes("Total for PO") && !cell12.includes("PO'") && !cell12.includes("POs")) {
+      // Col 26 = Total Costs ordered, col 29 = Total Invoiced, col 35 = To Be Invoiced
+      const totalOrdered  = vpNum(row[26]);
+      const totalInvoiced = vpNum(row[29]);
+      const toBeInvoiced  = vpNum(row[35]);
       currentPO.originalAmount  = totalOrdered;
       currentPO.adjustedAmount  = totalOrdered;
       if (totalInvoiced > 0) {
@@ -4140,104 +4812,107 @@ function vpImportCommitments(rows) {
 // 5. AR AGING → Pay Applications billed to owner
 // ─────────────────────────────────────────────────────────
 function vpImportARaging(rows) {
+  // ── AR Aging Report parser ──
+  // Viewpoint Vista row structure:
+  //   col1=invoice# (with * suffix), col6=invDate (Excel serial), col10=description
+  //   col15=total aged amount, col30=retainage amount
+  // Summary rows:
+  //   "Total Aged + Retain:" row → col15 = grand total retainage balance
+  //   "Total Collected:" → col15 = total collected
+  //   "Total Billed:" or "Total Invoice:" → col15 = total billed
+  //
+  // Also extract contract info from header:
+  //   "Original Contract:" → col15 or nearest numeric
+  //   "Revised Contract:"  → col15
+
+  // Extract header billing info
   const p = state.project;
-
-  // Discover invoice table columns from header text when possible
-  let headerIdx = -1;
-  let invCol = 1, dateCol = 6, descCol = 10, agedCol = 15, retainCol = 30;
-  for (let r=0; r<Math.min(rows.length,120); r++) {
-    const row = rows[r].map(v=>String(v||"").toLowerCase());
-    const hasInvoice = row.some(c=>c.includes("invoice"));
-    const hasDate = row.some(c=>c === "date" || c.includes("inv date"));
-    const hasAmount = row.some(c=>c.includes("aged") || c.includes("amount") || c.includes("total"));
-    if (hasInvoice && hasDate && hasAmount) {
-      headerIdx = r;
-      row.forEach((h,c)=>{
-        if (h.includes("invoice")) invCol = c;
-        else if (h === "date" || h.includes("inv date")) dateCol = c;
-        else if (h.includes("description")) descCol = c;
-        else if (h.includes("aged") || h.includes("face")) agedCol = c;
-        else if (h.includes("retain")) retainCol = c;
-      });
-      break;
-    }
-  }
-
-  for (let r = 0; r < Math.min(rows.length, 30); r++) {
-    const flatL = vpText(rows[r]).toLowerCase();
+  for (let r = 0; r < Math.min(rows.length, 20); r++) {
+    const flat = rows[r].map(v=>String(v)).join(" ");
+    const flatL = flat.toLowerCase();
     if (flatL.includes("original contract")) {
-      const nums = rows[r].map(v=>vpNum(v)).filter(v=>v>10000);
-      if (nums.length) p.contractAmount = p.contractAmount || nums[nums.length-1];
+      const nums = rows[r].filter(v => vpNum(v) > 10000);
+      if (nums.length) p.contractAmount = p.contractAmount || vpNum(nums[0]);
     }
     if (flatL.includes("revised contract") || flatL.includes("current contract")) {
-      const nums = rows[r].map(v=>vpNum(v)).filter(v=>v>10000);
-      if (nums.length) p.revisedContractAmount = nums[nums.length-1];
+      const nums = rows[r].filter(v => vpNum(v) > 10000);
+      if (nums.length) p.revisedContractAmount = vpNum(nums[0]);
     }
-    if (flatL.includes("pm:") || flatL.includes("project manager")) {
-      const pmCell = vpFindCell(rows[r], c=>/pm\s*:|project manager\s*:/i.test(c));
-      if (pmCell) {
-        const pm = vpCellNear(rows, r, pmCell.idx, 4).replace(/^\s*pm\s*:/i, "").trim();
-        if (pm && pm.length > 2 && !state.project.pm) state.project.pm = pm;
+    if (flatL.includes("pm:") || flatL.includes("project manager:")) {
+      for (let c = 0; c < rows[r].length; c++) {
+        const cv = String(rows[r][c]);
+        if (cv.match(/PM:/i)) {
+          const pm = cv.replace(/.*PM:\s*/i,"").trim();
+          if (pm && pm.length > 2 && !state.project.pm) state.project.pm = pm;
+        }
       }
     }
   }
 
+  // Parse invoice rows and summary rows
   const payApps = [];
   let totalBilled = 0, totalCollected = 0, totalRetainage = 0;
 
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
-    const flatL = vpText(row).toLowerCase();
+    const flatL = row.map(v=>String(v)).join(" ").toLowerCase();
 
+    // ── Summary rows ──
     if (flatL.includes("total aged") && flatL.includes("retain")) {
-      const nums = row.map(v=>vpNum(v)).filter(v=>v>0);
-      if (nums.length) totalRetainage = nums[nums.length-1];
+      // "Total Aged + Retain:" = retainage balance
+      const nums = row.filter(v => vpNum(v) > 0);
+      if (nums.length) totalRetainage = vpNum(nums[nums.length-1]);
       continue;
     }
     if (flatL.includes("total collected") || flatL.includes("total received")) {
-      const nums = row.map(v=>vpNum(v)).filter(v=>v>0);
-      if (nums.length) totalCollected = nums[nums.length-1];
+      const nums = row.filter(v => vpNum(v) > 0);
+      if (nums.length) totalCollected = vpNum(nums[nums.length-1]);
       continue;
     }
     if ((flatL.includes("total billed") || flatL.includes("total invoice")) && !flatL.includes("retainage")) {
-      const nums = row.map(v=>vpNum(v)).filter(v=>v>0);
-      if (nums.length) totalBilled = nums[nums.length-1];
+      const nums = row.filter(v => vpNum(v) > 0);
+      if (nums.length) totalBilled = vpNum(nums[nums.length-1]);
       continue;
     }
 
-    if (headerIdx >= 0 && r <= headerIdx) continue;
+    // ── Invoice detail rows ──
+    const invCell = String(row[1]||"").trim().replace(/\*/g,"").trim();
+    if (!invCell || isNaN(parseFloat(invCell))) continue;
+    const invNum = parseInt(invCell);
+    if (invNum < 100 || invNum > 9999) continue; // sanity: pay app numbers
 
-    const invCell = String(row[invCol]||"").trim().replace(/\*/g,"").trim();
-    const invNumRaw = invCell.match(/\d+/);
-    if (!invNumRaw || flatL.includes("total") || flatL.includes("summary")) continue;
-    const invNum = parseInt(invNumRaw[0],10);
-    if (invNum < 1 || invNum > 999999) continue;
+    const invDate  = vpDate(row[6]);
+    const desc     = String(row[10]||"").trim();
+    // col15 = total aged (invoice face amount), col30 = retainage held on this invoice
+    const aged     = vpNum(row[15]);
+    const retain   = vpNum(row[30]);
+    // Use aged amount if available (it represents the billed amount for the pay app)
+    const amount   = aged || retain;
 
-    const invDate = vpDate(row[dateCol]);
-    const desc = String(row[descCol]||"").trim();
-    const aged = vpNum(row[agedCol]);
-    const retain = vpNum(row[retainCol]);
-    const amount = aged || retain;
-    const looksLikeInvoiceRow = invDate || amount > 0 || desc;
-    if (!looksLikeInvoiceRow) continue;
+    if (!amount && !desc) continue;
 
     payApps.push({ invNum, invDate, desc, amount, retain, aged });
   }
 
   if (!payApps.length) return "AR Aging (no pay apps found)";
 
+  // ── Derive summary totals if not explicitly in file ──
   if (!totalRetainage) totalRetainage = payApps.reduce((s,p)=>s+p.retain, 0);
-  if (!totalBilled) totalBilled = payApps.reduce((s,p)=>s+p.aged, 0) || totalRetainage;
+  if (!totalBilled)    totalBilled    = payApps.reduce((s,p)=>s+p.aged, 0) || totalRetainage;
 
-  p.billedToDate = totalBilled || p.billedToDate;
-  p.collectedToDate = totalCollected || p.collectedToDate;
-  p.retainageBalance = totalRetainage || p.retainageBalance;
+  // ── Store billing progress on project ──
+  p.billedToDate      = totalBilled    || p.billedToDate;
+  p.collectedToDate   = totalCollected || p.collectedToDate;
+  p.retainageBalance  = totalRetainage || p.retainageBalance;
 
+  // ── Build or update PAY-APPS PO ──
   const existingAR = (state.purchaseOrders||[]).find(po => po.poNumber === "PAY-APPS");
+
   const invoices = payApps.map(pa => normalizeInvoice({
     id: uid(),
     number: String(pa.invNum),
     dateReceived: pa.invDate,
+    // Use aged (face value) as invoice amount so the PO total reflects billings, not just retainage
     amount: pa.aged || pa.retain || pa.amount,
     description: pa.desc || `Pay App ${pa.invNum}`
   }));
@@ -4245,31 +4920,30 @@ function vpImportARaging(rows) {
   const poAmount = totalBilled || invoices.reduce((s,i)=>s+i.amount,0);
 
   if (existingAR) {
-    existingAR.invoices = invoices;
+    existingAR.invoices       = invoices;
     existingAR.originalAmount = poAmount;
     existingAR.adjustedAmount = poAmount;
-    existingAR.vendor = existingAR.vendor || p.customer || "Owner";
+    existingAR.vendor         = existingAR.vendor || p.customer || "Owner";
   } else {
     if (!state.purchaseOrders) state.purchaseOrders = [];
     state.purchaseOrders.push({
       id: uid(),
-      poNumber: "PAY-APPS",
-      vendor: p.customer || "Owner",
-      description: "Customer Pay Applications (AR Aging)",
+      poNumber:      "PAY-APPS",
+      vendor:        p.customer || "Owner",
+      description:   "Customer Pay Applications (AR Aging)",
       originalAmount: poAmount,
       adjustedAmount: poAmount,
-      orderDate: "",
-      orderedBy: p.pm || "",
+      orderDate:     "",
+      orderedBy:     p.pm || "",
       invoices
     });
   }
 
-  const retFmt = totalRetainage ? `$${Math.round(totalRetainage).toLocaleString()} retainage` : "";
-  const billFmt = totalBilled ? `$${Math.round(totalBilled).toLocaleString()} billed` : "";
+  const retFmt   = totalRetainage  ? `$${Math.round(totalRetainage ).toLocaleString()} retainage` : "";
+  const billFmt  = totalBilled     ? `$${Math.round(totalBilled    ).toLocaleString()} billed`    : "";
   const collectFmt = totalCollected ? `, $${Math.round(totalCollected).toLocaleString()} collected` : "";
   return `AR Aging — ${payApps.length} pay apps (${billFmt}${collectFmt}${retFmt ? ", " + retFmt : ""})`;
 }
-
 
 // ─────────────────────────────────────────────────────────
 // 6. AP UNAPPROVED INVOICES → Invoice tracker notes
@@ -4415,7 +5089,7 @@ function importSubcontractors(rows, sheetName) {
       contractResponse:"",
       rfpSent:ci.rfpSent>=0?cleanDate(r[ci.rfpSent]):"",
       pricingReceived:ci.pricingRecv>=0?cleanDate(r[ci.pricingRecv]):"",
-      quote:ci.quote>=0?String(r[ci.quote]||"").trim():"",
+      quoteAmount:ci.quote>=0?vpNum(r[ci.quote]):0,
       selected:ci.selected>=0&&!!r[ci.selected],
       awarded:ci.awarded>=0&&!!r[ci.awarded],
       notes:ci.notes>=0?String(r[ci.notes]||"").trim():""
@@ -5109,7 +5783,7 @@ function buildSubSheet(wb, projName) {
   let lastTrade = "";
   for (const s of state.subcontractors) {
     if (s.trade !== lastTrade) { rows.push([s.trade]); lastTrade = s.trade; }
-    rows.push([s.company,s.contact,s.phone,s.email,s.pwa?"Y":"",s.union?"Y":"",s.contactDate,s.rfpSent,s.pricingReceived,s.quote,s.selected?"Y":"",s.awarded?"Y":"",s.notes]);
+    rows.push([s.company,s.contact,s.phone,s.email,s.pwa?"Y":"",s.union?"Y":"",s.contactDate,s.rfpSent,s.pricingReceived,+s.quoteAmount||0,s.selected?"Y":"",s.awarded?"Y":"",s.notes]);
   }
   const ws = XLSX.utils.aoa_to_sheet([[],[],...rows.slice(2)]);
   xlProjectHeader(ws, projName, "Subcontractor Scope Tracker", COLS.length);
@@ -5226,18 +5900,23 @@ function buildCostSheet(wb, projName) {
     {key:"material",label:"Material"},{key:"subs",label:"Subcontractors"},
     {key:"equipment",label:"Equipment"},{key:"admin",label:"Admin/Overhead"}
   ];
-  const COLS = ["Description","Budget","Committed","Actual","Forecast","Variance"];
+  const COLS = ["Description","Estimated","Month To Date","Job To Date","Projected","Variance","% Complete","Open/Committed","Unapproved AP"];
   const ws = XLSX.utils.aoa_to_sheet([[],[]]);
   xlProjectHeader(ws, projName, "Cost Breakdown", COLS.length);
   let row = 2;
   const allLines = Object.values(state.costs).flat();
-  const gBudget = allLines.reduce((s,l)=>s+(+l.budget||0),0);
+  const gBudget   = allLines.reduce((s,l)=>s+(+l.budget||0),0);
+  const gJTD      = allLines.reduce((s,l)=>s+(+l.actual||0),0);
   const gForecast = allLines.reduce((s,l)=>s+(+l.forecast||0),0);
+  const gVar      = gBudget - gForecast;
+  const gPct      = gBudget > 0 ? Math.round((gJTD/gBudget)*1000)/10 : 0;
   // Grand total row
   xlMerge(ws, row, 0, row, 0);
   xlSet(ws, row, 0, "PROJECT TOTAL", XL_STYLES.total);
-  [[1,gBudget],[4,gForecast],[5,gBudget-gForecast]].forEach(([c,v])=>{
-    xlSet(ws, row, c, v, v<0&&c===5 ? {...XL_STYLES.total,...XL_STYLES.moneyRed} : XL_STYLES.total);
+  [[1,gBudget],[3,gJTD],[4,gForecast],[5,gVar],[6,gPct/100]].forEach(([c,v])=>{
+    const isVar = c===5; const isPct = c===6;
+    const style = {...XL_STYLES.total, ...(isVar&&v<0?XL_STYLES.moneyRed:{}), ...(isPct?{numFmt:"0.0%"}:{})};
+    xlSet(ws, row, c, v, style);
   });
   row++;
   for (const cat of COST_CATS) {
@@ -5250,26 +5929,36 @@ function buildCostSheet(wb, projName) {
     // Column headers
     COLS.forEach((h,c) => xlSet(ws, row, c, h, XL_STYLES.header));
     row++;
-    let catBudget=0, catForecast=0;
+    let catEst=0, catMTD=0, catJTD=0, catProj=0, catComm=0, catUAP=0;
     lines.forEach((l,i) => {
-      const variance = (+ l.budget||0)-(+l.forecast||0);
-      catBudget   += +l.budget||0;
-      catForecast += +l.forecast||0;
-      xlSet(ws, row, 0, l.name, i%2===0 ? XL_STYLES.even : XL_STYLES.odd);
-      [[1,+l.budget||0],[2,+l.committed||0],[3,+l.actual||0],[4,+l.forecast||0],[5,variance]].forEach(([c,v])=>{
-        xlSet(ws, row, c, v, {...(i%2===0?XL_STYLES.even:XL_STYLES.odd), ...XL_STYLES.money, ...(v<0&&c===5?{font:{color:{rgb:"C1121F"}}}:{})});
-      });
+      const est  = +l.budget||0;
+      const mtd  = +l.mtd||0;
+      const jtd  = +l.actual||0;
+      const proj = +l.forecast||0;
+      const comm = +l.committed||0;
+      const uap  = +l.unapprovedAP||0;
+      const vari = est - proj;
+      const pct  = (l.pctComplete!==null&&l.pctComplete!==undefined&&l.pctComplete!=="") ? (+l.pctComplete)/100 : (est>0&&jtd>0 ? jtd/est : null);
+      catEst+=est; catMTD+=mtd; catJTD+=jtd; catProj+=proj; catComm+=comm; catUAP+=uap;
+      const base = i%2===0 ? XL_STYLES.even : XL_STYLES.odd;
+      xlSet(ws, row, 0, l.name, base);
+      [[1,est],[2,mtd],[3,jtd],[4,proj]].forEach(([c,v])=>xlSet(ws,row,c,v,{...base,...XL_STYLES.money}));
+      xlSet(ws,row,5,vari,{...base,...XL_STYLES.money,...(vari<0?{font:{color:{rgb:"C1121F"}}}:{})});
+      xlSet(ws,row,6,pct!==null?pct:"",(pct!==null?{...base,numFmt:"0.0%"}:base));
+      [[7,comm],[8,uap]].forEach(([c,v])=>xlSet(ws,row,c,v,{...base,...XL_STYLES.money,...(c===8&&v>0?{font:{color:{rgb:"C1121F"}}}:{})}));
       row++;
     });
     // Subtotal
-    const catVar = catBudget - catForecast;
+    const catVar = catEst - catProj;
+    const catPct = catEst>0 ? catJTD/catEst : null;
     xlSet(ws, row, 0, `${cat.label} Subtotal`, XL_STYLES.subHead);
-    [[1,catBudget],[4,catForecast],[5,catVar]].forEach(([c,v])=>{
-      xlSet(ws, row, c, v, {...XL_STYLES.subHead, ...XL_STYLES.money, ...(v<0&&c===5?{font:{bold:true,color:{rgb:"C1121F"}}}:{})});
-    });
+    [[1,catEst],[2,catMTD],[3,catJTD],[4,catProj]].forEach(([c,v])=>xlSet(ws,row,c,v,{...XL_STYLES.subHead,...XL_STYLES.money}));
+    xlSet(ws,row,5,catVar,{...XL_STYLES.subHead,...XL_STYLES.money,...(catVar<0?{font:{bold:true,color:{rgb:"C1121F"}}}:{})});
+    xlSet(ws,row,6,catPct!==null?catPct:"",catPct!==null?{...XL_STYLES.subHead,numFmt:"0.0%"}:XL_STYLES.subHead);
+    [[7,catComm],[8,catUAP]].forEach(([c,v])=>xlSet(ws,row,c,v,{...XL_STYLES.subHead,...XL_STYLES.money}));
     row += 2;
   }
-  ws["!cols"] = [{wch:34},{wch:14},{wch:14},{wch:14},{wch:14},{wch:14}];
+  ws["!cols"] = [{wch:34},{wch:13},{wch:13},{wch:13},{wch:13},{wch:13},{wch:10},{wch:14},{wch:14}];
   xlFreeze(ws, 3);
   // Update ref
   ws["!ref"] = XLSX.utils.encode_range({s:{r:0,c:0},e:{r:row,c:COLS.length-1}});
@@ -5548,10 +6237,21 @@ ${(()=>{
     const lines = state.costs[cat.key]||[];
     const totB = lines.reduce((s,l)=>s+(+l.budget||0),0);
     const totF = lines.reduce((s,l)=>s+(+l.forecast||0),0);
+    const totMTD = lines.reduce((s,l)=>s+(+l.mtd||0),0);
+    const totJTD = lines.reduce((s,l)=>s+(+l.actual||0),0);
+    const totComm= lines.reduce((s,l)=>s+(+l.committed||0),0);
+    const totUAP = lines.reduce((s,l)=>s+(+l.unapprovedAP||0),0);
+    const totVar = totB - totF;
+    const totPct = totB>0 ? Math.round((totJTD/totB)*1000)/10 : null;
     return `<h3>${cat.label}</h3>
-    <table><thead>${th("Description","Budget","Committed","Actual","Forecast","Variance")}</thead><tbody>
-    ${lines.map(l=>{const v=(+l.budget||0)-(+l.forecast||0);return td(l.name,$(+l.budget),$(+l.committed),$(+l.actual),$(+l.forecast),`<span style="color:${v>=0?"#2D6A4F":"#C1121F"}">${$(v)}</span>`);}).join("")}
-    <tr class="summary-row"><td>Subtotal</td><td class="right">${$(totB)}</td><td></td><td></td><td class="right">${$(totF)}</td><td class="right" style="color:${totB-totF>=0?"#2D6A4F":"#C1121F"}">${$(totB-totF)}</td></tr>
+    <table><thead>${th("Description","Estimated","MTD","Job To Date","Projected","Variance","% Complete","Open/Committed","Unapproved AP")}</thead><tbody>
+    ${lines.map(l=>{
+      const est=+l.budget||0,mtd=+l.mtd||0,jtd=+l.actual||0,proj=+l.forecast||0,comm=+l.committed||0,uap=+l.unapprovedAP||0;
+      const v=est-proj;
+      const pct=(l.pctComplete!==null&&l.pctComplete!==undefined&&l.pctComplete!=="") ? (+l.pctComplete).toFixed(1)+"%" : (est>0&&jtd>0 ? Math.round((jtd/est)*1000)/10+"%" : "—");
+      return td(l.name,$(est),$(mtd),$(jtd),$(proj),`<span style="color:${v>=0?"#2D6A4F":"#C1121F"}">${$(v)}</span>`,pct,`<span style="color:#E07A27">${$(comm)}</span>`,uap>0?`<span style="color:#C1121F">${$(uap)}</span>`:"—");
+    }).join("")}
+    <tr class="summary-row"><td>Subtotal</td><td class="right">${$(totB)}</td><td class="right">${$(totMTD)}</td><td class="right">${$(totJTD)}</td><td class="right">${$(totF)}</td><td class="right" style="color:${totVar>=0?"#2D6A4F":"#C1121F"}">${$(totVar)}</td><td>${totPct!==null?totPct.toFixed(1)+"%":"—"}</td><td class="right">${$(totComm)}</td><td class="right" style="color:${totUAP>0?"#C1121F":"inherit"}">${$(totUAP)}</td></tr>
     </tbody></table>`;
   }).join("");
 })()}
@@ -5616,7 +6316,7 @@ ${state.schedule.tasks.map(t=>{
 <table><thead>${th("Trade","Company","Contact","Quote","Sel","Awd","Notes")}</thead><tbody>
 ${(state.subcontractors||[]).map(s=>`<tr>
   <td>${s.trade||"—"}</td><td>${s.company||"—"}</td><td>${s.contact||"—"} ${s.phone?`<br><span style="color:#9A8C98;font-size:10px">${s.phone}</span>`:""}</td>
-  <td class="right">${s.quote||"—"}</td>
+  <td class="right">${s.quoteAmount ? fmt$(+s.quoteAmount) : "—"}</td>
   <td style="text-align:center">${s.selected?"✓":""}</td>
   <td style="text-align:center;color:${s.awarded?"#2D6A4F":"inherit"};font-weight:${s.awarded?"700":"400"}">${s.awarded?"✓":""}</td>
   <td>${s.notes||""}</td>
@@ -6431,7 +7131,7 @@ function buildSearchIndex() {
   for (const s of (state.subcontractors||[])) {
     add("subcontractors","🏗️",
       `${s.company||"Unknown"}${s.trade?" ["+s.trade+"]":""}`,
-      [s.contact, s.phone, s.email, s.awarded?"AWARDED":"", s.quote?"Quote: "+s.quote:""].filter(Boolean).join(" · ").substring(0,100),
+      [s.contact, s.phone, s.email, s.awarded?"AWARDED":"", s.quoteAmount?"Quote: "+fmt$(+s.quoteAmount):""].filter(Boolean).join(" · ").substring(0,100),
       s.id, s.awarded?1.3:1);
   }
 

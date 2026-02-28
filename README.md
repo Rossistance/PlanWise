@@ -26,7 +26,7 @@ Deploy to GitHub Pages: `https://<your-username>.github.io/<repo-name>/`
 | **Dashboard** | RAG status cards, donut charts, KPI grid, activity log |
 | **Portfolio** | Multi-project portfolio view (cross-project summary) |
 
-### Import Engine (Viewpoint Vista / Siemens XLS)
+### Import Engine (Viewpoint Vista XLS)
 
 Drag-and-drop import for all 6 standard Viewpoint export types:
 
