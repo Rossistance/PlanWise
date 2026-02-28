@@ -3370,7 +3370,7 @@ function importVistaPOFromText(text, poNumber, filename) {
   const description = descMatch ? descMatch[1].trim() : `PO ${poNumber}`;
 
   // Check if this PO already exists
-  const existingPO = state.purchaseOrders.find(po => po.number === poNumber || po.number === String(poNumber));
+  const existingPO = state.purchaseOrders.find(po => String(po.poNumber||"") === String(poNumber));
   if (existingPO) {
     // Update amount if changed
     if (amount && Math.abs(existingPO.originalAmount - amount) > 1) {
@@ -3383,7 +3383,7 @@ function importVistaPOFromText(text, poNumber, filename) {
   // Create new PO
   const newPO = {
     id: uid(),
-    number: String(poNumber),
+    poNumber: String(poNumber),
     vendor: vendor,
     description: description,
     originalAmount: amount,
@@ -3519,7 +3519,7 @@ function tryViewpointImport(wb, nameLower, originalName) {
       (topText.includes("contract costs to date") && topText.includes("estimated"))) {
     return vpImportJobCostMain(rows);
   }
-  if (topText.includes("jc detail") || (nameLower.includes("job_cost_detail") && !nameLower.includes("main"))) {
+  if (topText.includes("jc detail") || topText.includes("job cost detail") || (nameLower.includes("job_cost_detail") && !nameLower.includes("main"))) {
     return vpImportJobCostDetail(rows);
   }
   if (topText.includes("contract control sheet") || topText.includes("pco") && topText.includes("aco") && topText.includes("approved")) {
@@ -3574,6 +3574,27 @@ function vpCellNear(rows, r, c, offset=1) {
 }
 
 function vpNum(v) { return parseFloat(String(v).replace(/[$,]/g,'')) || 0; }
+
+function vpText(row) {
+  return row.map(v=>String(v||"").trim()).filter(Boolean).join(" ");
+}
+
+function vpFindCell(row, matcher) {
+  for (let i=0; i<row.length; i++) {
+    const cell = String(row[i]||"");
+    if (matcher(cell)) return { idx:i, value:cell };
+  }
+  return null;
+}
+
+function vpFindNumberNear(row, idx, window=6) {
+  let best = 0;
+  for (let c=Math.max(0, idx+1); c<Math.min(row.length, idx+1+window); c++) {
+    const n = vpNum(row[c]);
+    if (n !== 0) { best = n; break; }
+  }
+  return best;
+}
 
 // ─────────────────────────────────────────────────────────
 // 1. JOB COST DETAIL MAIN PAGE → Cost Breakdown + Project Overview
@@ -3865,66 +3886,78 @@ function importJobSetupBreakdown(rows) {
 
 // ─────────────────────────────────────────────────────────
 // 3. CONTRACT CONTROL SHEET → Change Orders
-// Siemens layout:
-//   - CO header row: col 0=date, col 5=description, col 9=PCO, col 12=ACO, col 17=Total CO Amount
-//   - Phase detail rows: same PCO/ACO, col 17 empty, col 38=phase cost
-//   - Subtotal row: col 5="Subtotal for OTHER", col 12=ACO, col 38=total cost for CO
-// Strategy: use col 17 from the header row for single-phase COs;
-//           use col 38 from subtotal rows for multi-phase COs where col 17 is empty.
 // ─────────────────────────────────────────────────────────
 function vpImportContract(rows) {
-  // ── Multi-phase CO parser ──
-  // Viewpoint Contract Control Sheet has 3 row types per CO:
-  //   1. Header row:   col5=description, col9=PCO, col12=ACO, col13=Cd, col0=date, col3=apprDate
-  //                    col17 MAY be blank (multi-phase) or have full amount (single-phase)
-  //   2. Phase rows:   same PCO/ACO, col17=phase amount, col38=phase cost — accumulate
-  //   3. Subtotal row: col5="Subtotal for OTHER:", col38=total CO cost — finalizes amount
   const cos = [];
-  const coMap = {}; // key(aco||pco) → CO object
-  let _currentKey = null;
-  let _phaseCumulative = 0;  // accumulated col17 from phase rows
-  let _subtotalCost = 0;     // col38 from subtotal row
+  const coMap = {};
+  let currentKey = null;
+  let phaseCumulative = 0;
 
+  // Detect columns from the header row so we are not tied to a single export layout
   let foundHeader = false;
+  let idx = { date:0, approvedDate:3, desc:5, pco:9, aco:12, cd:13, amount:17, subtotal:38 };
+
+  let bestHeader = -1;
+  let bestScore = 0;
+  for (let r = 0; r < Math.min(rows.length, 160); r++) {
+    const flat = vpText(rows[r]).toLowerCase();
+    let score = 0;
+    if (flat.includes("description")) score++;
+    if (flat.includes("pco") || flat.includes("proposal")) score++;
+    if (flat.includes("aco") || flat.includes("approved")) score++;
+    if (flat.includes("date")) score++;
+    if (flat.includes("amount") || flat.includes("cost")) score++;
+    if (score > bestScore) { bestScore = score; bestHeader = r; }
+  }
+  if (bestHeader >= 0 && bestScore >= 3) {
+    foundHeader = true;
+    rows[bestHeader].forEach((v,c)=>{
+      const h = String(v||"").toLowerCase();
+      if (h.includes("description")) idx.desc = c;
+      else if (h === "pco" || h.includes("pco #") || h.includes("proposal")) idx.pco = c;
+      else if (h === "aco" || h.includes("aco #") || h.includes("approved chg")) idx.aco = c;
+      else if (h === "cd" || h.includes("code")) idx.cd = c;
+      else if (h.includes("date") && h.includes("approved")) idx.approvedDate = c;
+      else if (h.includes("date") && !h.includes("approved")) idx.date = c;
+      else if (h.includes("amount") && (h.includes("co") || h.includes("change"))) idx.amount = c;
+      else if (h.includes("cost") || h.includes("subtotal")) idx.subtotal = c;
+    });
+  } else {
+    foundHeader = true; // fallback to legacy defaults
+  }
+
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
-    const flat = row.map(v=>String(v)).join(" ").toLowerCase();
+    const flat = vpText(row).toLowerCase();
 
-    // Find data header row
     if (!foundHeader) {
-      if (flat.includes("description") && (flat.includes("pco") || flat.includes("approved"))) {
-        foundHeader = true;
-      }
       continue;
     }
 
-    // Skip legend / page-break rows
-    if (flat.includes("codes:") || flat.includes("page ") || flat.includes("approved:") && flat.includes("pending:")) continue;
+    if (flat.includes("codes:") || flat.includes("page ")) continue;
 
-    const descCell = String(row[5]||"").trim();
-    const pcoRaw   = String(row[9]||"").trim().replace(/\s+/g,"");
-    const acoRaw   = String(row[12]||"").trim().replace(/\s+/g,"");
-    const cdRaw    = String(row[13]||"").trim();
-    const dateRaw  = vpDate(row[0]);
-    const apprRaw  = vpDate(row[3]);
-    const col17amt = vpNum(row[17]);
-    const col38amt = vpNum(row[38]);
+    const descCell = String(row[idx.desc]||"").trim();
+    const pcoRaw0  = String(row[idx.pco]||"").trim().replace(/\s+/g,"");
+    const acoRaw0  = String(row[idx.aco]||"").trim().replace(/\s+/g,"");
+    const pcoMatch = flat.match(/\bPCO[-\s]*#?\s*([A-Z0-9-]{1,})/i);
+    const acoMatch = flat.match(/\bACO[-\s]*#?\s*([A-Z0-9-]{1,})/i);
+    const pcoRaw   = pcoRaw0 || (pcoMatch ? pcoMatch[1] : "");
+    const acoRaw   = acoRaw0 || (acoMatch ? acoMatch[1] : "");
+    const cdRaw    = String(row[idx.cd]||"").trim();
+    const dateRaw  = vpDate(row[idx.date]);
+    const apprRaw  = vpDate(row[idx.approvedDate]);
+    const amt      = vpNum(row[idx.amount]);
+    const subAmt   = vpNum(row[idx.subtotal]);
 
-    // Skip completely empty rows
-    if (!descCell && !pcoRaw && !acoRaw && !col17amt && !col38amt) continue;
-    // Skip grand totals row
-    if (flat.includes("grand total") || (flat.includes("total") && !pcoRaw && !acoRaw && !descCell)) continue;
+    if (!descCell && !pcoRaw && !acoRaw && !amt && !subAmt) continue;
+    if (flat.includes("grand total")) continue;
 
-    // ── Subtotal row ──
-    // e.g. "Subtotal for OTHER:", col38 = total cost for this CO
-    if (descCell.toLowerCase().startsWith("subtotal") && _currentKey) {
-      const co = coMap[_currentKey];
+    if (descCell.toLowerCase().startsWith("subtotal") && currentKey) {
+      const co = coMap[currentKey];
+      if (co && co.amountSubmitted === 0) {
+        co.amountSubmitted = phaseCumulative || subAmt || 0;
+      }
       if (co) {
-        // Finalize amount: prefer accumulated phase col17, else col38 subtotal cost
-        if (co.amountSubmitted === 0) {
-          co.amountSubmitted = _phaseCumulative || col38amt || 0;
-        }
-        // Set approved/pending based on finalized amount
         if (co._cdRaw === "A" || (co.dateApproved && co._cdRaw !== "P")) {
           co.amountApproved = Math.abs(co.amountSubmitted);
           co.amountPending = 0;
@@ -3933,86 +3966,61 @@ function vpImportContract(rows) {
           co.amountApproved = 0;
         }
       }
-      _currentKey = null;
-      _phaseCumulative = 0;
-      _subtotalCost = 0;
+      currentKey = null;
+      phaseCumulative = 0;
       continue;
     }
 
-    const pco = pcoRaw;
-    const aco = acoRaw;
-    const key = aco || pco;
+    const key = acoRaw || pcoRaw;
     if (!key || key === "0") continue;
-
-    // Skip "Original Contract" base row
     if (descCell === "Original Contract" || descCell === "Base Contract") continue;
 
     if (coMap[key]) {
-      // ── Phase detail row for existing CO ──
-      // Accumulate col17 phase amounts; also track col38
-      if (col17amt) _phaseCumulative += col17amt;
-      _currentKey = key;
-    } else {
-      // ── New CO header row ──
-      // Require at minimum a description or a non-zero amount
-      if (!descCell && !col17amt && !col38amt) continue;
-
-      _currentKey = key;
-      _phaseCumulative = col17amt || 0;
-      _subtotalCost = 0;
-
-      const co = {
-        id: uid(),
-        coNumber: aco || pco,
-        dateSubmitted: dateRaw,
-        dateApproved: apprRaw,
-        description: descCell,
-        // amountSubmitted finalized on subtotal row (or now if col17 is set)
-        amountSubmitted: col17amt || 0,
-        amountPending:   0,
-        amountApproved:  0,
-        custCONumber: pco,
-        approvedBy: "",
-        _cdRaw: cdRaw   // temp field for status resolution
-      };
-
-      // For single-phase COs col17 is set on header row — no subtotal row follows
-      // Resolve immediately if col17 is present
-      if (col17amt) {
-        const isApproved = cdRaw === "A" || (apprRaw && cdRaw !== "P") || (!cdRaw && apprRaw);
-        const isRejected = cdRaw === "V" || cdRaw === "D";
-        if (isApproved) {
-          co.amountApproved = Math.abs(col17amt);
-        } else if (!isRejected) {
-          co.amountPending = Math.abs(col17amt);
-        }
-      }
-
-      coMap[key] = co;
-      cos.push(co);
+      if (amt) phaseCumulative += amt;
+      currentKey = key;
+      continue;
     }
+
+    currentKey = key;
+    phaseCumulative = amt || 0;
+
+    const co = {
+      id: uid(),
+      coNumber: acoRaw || pcoRaw,
+      dateSubmitted: dateRaw,
+      dateApproved: apprRaw,
+      description: descCell,
+      amountSubmitted: amt || 0,
+      amountPending: 0,
+      amountApproved: 0,
+      custCONumber: pcoRaw,
+      approvedBy: "",
+      _cdRaw: cdRaw
+    };
+
+    if (amt) {
+      const isApproved = cdRaw === "A" || (apprRaw && cdRaw !== "P") || (!cdRaw && apprRaw);
+      const isRejected = cdRaw === "V" || cdRaw === "D";
+      if (isApproved) co.amountApproved = Math.abs(amt);
+      else if (!isRejected) co.amountPending = Math.abs(amt);
+    }
+
+    coMap[key] = co;
+    cos.push(co);
   }
 
-  // Handle any CO that never got a subtotal row (single-phase, file truncated, etc.)
-  if (_currentKey && coMap[_currentKey]) {
-    const co = coMap[_currentKey];
-    if (co.amountSubmitted === 0 && _phaseCumulative) {
-      co.amountSubmitted = _phaseCumulative;
-    }
+  if (currentKey && coMap[currentKey]) {
+    const co = coMap[currentKey];
+    if (co.amountSubmitted === 0 && phaseCumulative) co.amountSubmitted = phaseCumulative;
   }
 
-  // Clean up temp fields and merge into state
   let created = 0, updated = 0;
   for (const co of cos) {
     delete co._cdRaw;
-    // skip COs that ended up with zero amounts AND no description (phantom rows)
     if (!co.description && !co.amountSubmitted) continue;
-
     const exists = state.changeOrders.find(c => c.coNumber === co.coNumber);
-    if (!exists) {
-      state.changeOrders.push(co);
-      created++;
-    } else {
+    if (!exists) { state.changeOrders.push(co); created++; }
+    else {
       exists.description     = exists.description     || co.description;
       exists.amountSubmitted = exists.amountSubmitted || co.amountSubmitted;
       exists.amountApproved  = exists.amountApproved  || co.amountApproved;
@@ -4021,10 +4029,11 @@ function vpImportContract(rows) {
     }
   }
 
-  const approved = cos.filter(c=>c.amountApproved>0||c.amountApproved<0).length;
-  const pending  = cos.filter(c=>c.amountPending >0).length;
+  const approved = cos.filter(c=>c.amountApproved!==0).length;
+  const pending  = cos.filter(c=>c.amountPending>0).length;
   return `Contract Control Sheet — ${created} COs imported (${approved} approved, ${pending} pending)`;
 }
+
 
 // ─────────────────────────────────────────────────────────
 // 4. OPEN COMMITMENTS → Purchase Orders
@@ -4035,21 +4044,28 @@ function vpImportCommitments(rows) {
 
   for (let r=0; r<rows.length; r++) {
     const row = rows[r];
-    // Detect PO header row: "PO  24-003092   Description"
-    const cell1 = String(row[1]||"").trim();
-    if (cell1.startsWith("PO ") || cell1.startsWith("PO\t")) {
-      // Parse PO number and description from cell1: "PO  24-003092   Description text"
-      const parts = cell1.replace(/\s+/g," ").split(" ");
-      const poNum = parts[1] || "";
-      const poDesc = parts.slice(2).join(" ").trim();
+    const flat = vpText(row);
 
-      // Vendor is at col 26: "Vendor: RENTALL CONSTRUCTION, INC.  (315)"
-      const vendorRaw = String(row[26]||"").trim();
-      const vendor = vendorRaw.replace(/Vendor:\s*/i,"").split("(")[0].trim();
+    // Detect PO header row by content, not fixed column offsets
+    const poHeader = flat.match(/\bPO\s*[:#-]?\s*([A-Z0-9-]{4,})\b/i);
+    if (poHeader && !/total\s+for\s+po/i.test(flat)) {
+      const poNum = poHeader[1] || "";
+      const poStart = poHeader.index ?? 0;
+      const poDesc = flat.slice(poStart + poHeader[0].length).trim();
 
-      // Order date col 16, ordered-by col 18
-      const orderDate = vpDate(row[16]);
-      const orderedBy = String(row[18]||"").trim();
+      const vendorCell = vpFindCell(row, c=>/^\s*vendor\s*:/i.test(c) || /^\s*vendor\b/i.test(c));
+      let vendor = "";
+      if (vendorCell) {
+        vendor = String(vpCellNear(rows, r, vendorCell.idx, 4)).replace(/Vendor:\s*/i,"").split("(")[0].trim();
+        if (!vendor || /^\(?\d+\)?$/.test(vendor)) {
+          vendor = String(vendorCell.value).replace(/Vendor:\s*/i,"").split("(")[0].trim();
+        }
+      }
+
+      const orderDateCell = vpFindCell(row, c=>/order\s*date\s*:/i.test(c));
+      const orderedByCell = vpFindCell(row, c=>/ordered\s*by\s*:/i.test(c));
+      const orderDate = orderDateCell ? vpDate(vpCellNear(rows, r, orderDateCell.idx, 3)) : "";
+      const orderedBy = orderedByCell ? vpCellNear(rows, r, orderedByCell.idx, 3) : "";
 
       currentPO = {
         id: uid(),
@@ -4065,14 +4081,20 @@ function vpImportCommitments(rows) {
       pos.push(currentPO);
     }
 
-    // Total for PO row: "Total for PO:  24-003092:"
-    // Guard: skip the grand "Total for PO's" summary row (note the apostrophe)
-    const cell12 = String(row[12]||"").trim();
-    if (currentPO && cell12.includes("Total for PO") && !cell12.includes("PO'") && !cell12.includes("POs")) {
-      // Col 26 = Total Costs ordered, col 29 = Total Invoiced, col 35 = To Be Invoiced
-      const totalOrdered  = vpNum(row[26]);
-      const totalInvoiced = vpNum(row[29]);
-      const toBeInvoiced  = vpNum(row[35]);
+    // Total for PO row
+    if (currentPO && /total\s+for\s+po/i.test(flat) && !/total\s+for\s+po'?s/i.test(flat)) {
+      const totalCostsCell = vpFindCell(row, c=>/total\s+costs?/i.test(c));
+      const totalInvoicedCell = vpFindCell(row, c=>/total\s+invoiced/i.test(c));
+
+      let totalOrdered = totalCostsCell ? vpFindNumberNear(row, totalCostsCell.idx, 8) : 0;
+      let totalInvoiced = totalInvoicedCell ? vpFindNumberNear(row, totalInvoicedCell.idx, 8) : 0;
+
+      if (!totalOrdered && !totalInvoiced) {
+        const nums = row.map(v=>vpNum(v)).filter(n=>n>0);
+        totalOrdered = nums[0] || 0;
+        totalInvoiced = nums[1] || 0;
+      }
+
       currentPO.originalAmount  = totalOrdered;
       currentPO.adjustedAmount  = totalOrdered;
       if (totalInvoiced > 0) {
@@ -4118,107 +4140,104 @@ function vpImportCommitments(rows) {
 // 5. AR AGING → Pay Applications billed to owner
 // ─────────────────────────────────────────────────────────
 function vpImportARaging(rows) {
-  // ── AR Aging Report parser ──
-  // Row structure (Siemens actual):
-  //   col1=invoice# (with * suffix), col6=invDate (Excel serial), col10=description
-  //   col15=total aged amount, col30=retainage amount
-  // Summary rows:
-  //   "Total Aged + Retain:" row → col15 = grand total retainage balance
-  //   "Total Collected:" → col15 = total collected
-  //   "Total Billed:" or "Total Invoice:" → col15 = total billed
-  //
-  // Also extract contract info from header:
-  //   "Original Contract:" → col15 or nearest numeric
-  //   "Revised Contract:"  → col15
-
-  // Extract header billing info
   const p = state.project;
-  for (let r = 0; r < Math.min(rows.length, 20); r++) {
-    const flat = rows[r].map(v=>String(v)).join(" ");
-    const flatL = flat.toLowerCase();
+
+  // Discover invoice table columns from header text when possible
+  let headerIdx = -1;
+  let invCol = 1, dateCol = 6, descCol = 10, agedCol = 15, retainCol = 30;
+  for (let r=0; r<Math.min(rows.length,120); r++) {
+    const row = rows[r].map(v=>String(v||"").toLowerCase());
+    const hasInvoice = row.some(c=>c.includes("invoice"));
+    const hasDate = row.some(c=>c === "date" || c.includes("inv date"));
+    const hasAmount = row.some(c=>c.includes("aged") || c.includes("amount") || c.includes("total"));
+    if (hasInvoice && hasDate && hasAmount) {
+      headerIdx = r;
+      row.forEach((h,c)=>{
+        if (h.includes("invoice")) invCol = c;
+        else if (h === "date" || h.includes("inv date")) dateCol = c;
+        else if (h.includes("description")) descCol = c;
+        else if (h.includes("aged") || h.includes("face")) agedCol = c;
+        else if (h.includes("retain")) retainCol = c;
+      });
+      break;
+    }
+  }
+
+  for (let r = 0; r < Math.min(rows.length, 30); r++) {
+    const flatL = vpText(rows[r]).toLowerCase();
     if (flatL.includes("original contract")) {
-      const nums = rows[r].filter(v => vpNum(v) > 10000);
-      if (nums.length) p.contractAmount = p.contractAmount || vpNum(nums[0]);
+      const nums = rows[r].map(v=>vpNum(v)).filter(v=>v>10000);
+      if (nums.length) p.contractAmount = p.contractAmount || nums[nums.length-1];
     }
     if (flatL.includes("revised contract") || flatL.includes("current contract")) {
-      const nums = rows[r].filter(v => vpNum(v) > 10000);
-      if (nums.length) p.revisedContractAmount = vpNum(nums[0]);
+      const nums = rows[r].map(v=>vpNum(v)).filter(v=>v>10000);
+      if (nums.length) p.revisedContractAmount = nums[nums.length-1];
     }
-    if (flatL.includes("pm:") || flatL.includes("project manager:")) {
-      for (let c = 0; c < rows[r].length; c++) {
-        const cv = String(rows[r][c]);
-        if (cv.match(/PM:/i)) {
-          const pm = cv.replace(/.*PM:\s*/i,"").trim();
-          if (pm && pm.length > 2 && !state.project.pm) state.project.pm = pm;
-        }
+    if (flatL.includes("pm:") || flatL.includes("project manager")) {
+      const pmCell = vpFindCell(rows[r], c=>/pm\s*:|project manager\s*:/i.test(c));
+      if (pmCell) {
+        const pm = vpCellNear(rows, r, pmCell.idx, 4).replace(/^\s*pm\s*:/i, "").trim();
+        if (pm && pm.length > 2 && !state.project.pm) state.project.pm = pm;
       }
     }
   }
 
-  // Parse invoice rows and summary rows
   const payApps = [];
   let totalBilled = 0, totalCollected = 0, totalRetainage = 0;
 
   for (let r = 0; r < rows.length; r++) {
     const row = rows[r];
-    const flatL = row.map(v=>String(v)).join(" ").toLowerCase();
+    const flatL = vpText(row).toLowerCase();
 
-    // ── Summary rows ──
     if (flatL.includes("total aged") && flatL.includes("retain")) {
-      // "Total Aged + Retain:" = retainage balance
-      const nums = row.filter(v => vpNum(v) > 0);
-      if (nums.length) totalRetainage = vpNum(nums[nums.length-1]);
+      const nums = row.map(v=>vpNum(v)).filter(v=>v>0);
+      if (nums.length) totalRetainage = nums[nums.length-1];
       continue;
     }
     if (flatL.includes("total collected") || flatL.includes("total received")) {
-      const nums = row.filter(v => vpNum(v) > 0);
-      if (nums.length) totalCollected = vpNum(nums[nums.length-1]);
+      const nums = row.map(v=>vpNum(v)).filter(v=>v>0);
+      if (nums.length) totalCollected = nums[nums.length-1];
       continue;
     }
     if ((flatL.includes("total billed") || flatL.includes("total invoice")) && !flatL.includes("retainage")) {
-      const nums = row.filter(v => vpNum(v) > 0);
-      if (nums.length) totalBilled = vpNum(nums[nums.length-1]);
+      const nums = row.map(v=>vpNum(v)).filter(v=>v>0);
+      if (nums.length) totalBilled = nums[nums.length-1];
       continue;
     }
 
-    // ── Invoice detail rows ──
-    const invCell = String(row[1]||"").trim().replace(/\*/g,"").trim();
-    if (!invCell || isNaN(parseFloat(invCell))) continue;
-    const invNum = parseInt(invCell);
-    if (invNum < 100 || invNum > 9999) continue; // sanity: pay app numbers
+    if (headerIdx >= 0 && r <= headerIdx) continue;
 
-    const invDate  = vpDate(row[6]);
-    const desc     = String(row[10]||"").trim();
-    // col15 = total aged (invoice face amount), col30 = retainage held on this invoice
-    const aged     = vpNum(row[15]);
-    const retain   = vpNum(row[30]);
-    // Use aged amount if available (it represents the billed amount for the pay app)
-    const amount   = aged || retain;
+    const invCell = String(row[invCol]||"").trim().replace(/\*/g,"").trim();
+    const invNumRaw = invCell.match(/\d+/);
+    if (!invNumRaw || flatL.includes("total") || flatL.includes("summary")) continue;
+    const invNum = parseInt(invNumRaw[0],10);
+    if (invNum < 1 || invNum > 999999) continue;
 
-    if (!amount && !desc) continue;
+    const invDate = vpDate(row[dateCol]);
+    const desc = String(row[descCol]||"").trim();
+    const aged = vpNum(row[agedCol]);
+    const retain = vpNum(row[retainCol]);
+    const amount = aged || retain;
+    const looksLikeInvoiceRow = invDate || amount > 0 || desc;
+    if (!looksLikeInvoiceRow) continue;
 
     payApps.push({ invNum, invDate, desc, amount, retain, aged });
   }
 
   if (!payApps.length) return "AR Aging (no pay apps found)";
 
-  // ── Derive summary totals if not explicitly in file ──
   if (!totalRetainage) totalRetainage = payApps.reduce((s,p)=>s+p.retain, 0);
-  if (!totalBilled)    totalBilled    = payApps.reduce((s,p)=>s+p.aged, 0) || totalRetainage;
+  if (!totalBilled) totalBilled = payApps.reduce((s,p)=>s+p.aged, 0) || totalRetainage;
 
-  // ── Store billing progress on project ──
-  p.billedToDate      = totalBilled    || p.billedToDate;
-  p.collectedToDate   = totalCollected || p.collectedToDate;
-  p.retainageBalance  = totalRetainage || p.retainageBalance;
+  p.billedToDate = totalBilled || p.billedToDate;
+  p.collectedToDate = totalCollected || p.collectedToDate;
+  p.retainageBalance = totalRetainage || p.retainageBalance;
 
-  // ── Build or update PAY-APPS PO ──
   const existingAR = (state.purchaseOrders||[]).find(po => po.poNumber === "PAY-APPS");
-
   const invoices = payApps.map(pa => normalizeInvoice({
     id: uid(),
     number: String(pa.invNum),
     dateReceived: pa.invDate,
-    // Use aged (face value) as invoice amount so the PO total reflects billings, not just retainage
     amount: pa.aged || pa.retain || pa.amount,
     description: pa.desc || `Pay App ${pa.invNum}`
   }));
@@ -4226,30 +4245,31 @@ function vpImportARaging(rows) {
   const poAmount = totalBilled || invoices.reduce((s,i)=>s+i.amount,0);
 
   if (existingAR) {
-    existingAR.invoices       = invoices;
+    existingAR.invoices = invoices;
     existingAR.originalAmount = poAmount;
     existingAR.adjustedAmount = poAmount;
-    existingAR.vendor         = existingAR.vendor || p.customer || "Owner";
+    existingAR.vendor = existingAR.vendor || p.customer || "Owner";
   } else {
     if (!state.purchaseOrders) state.purchaseOrders = [];
     state.purchaseOrders.push({
       id: uid(),
-      poNumber:      "PAY-APPS",
-      vendor:        p.customer || "Owner",
-      description:   "Customer Pay Applications (AR Aging)",
+      poNumber: "PAY-APPS",
+      vendor: p.customer || "Owner",
+      description: "Customer Pay Applications (AR Aging)",
       originalAmount: poAmount,
       adjustedAmount: poAmount,
-      orderDate:     "",
-      orderedBy:     p.pm || "",
+      orderDate: "",
+      orderedBy: p.pm || "",
       invoices
     });
   }
 
-  const retFmt   = totalRetainage  ? `$${Math.round(totalRetainage ).toLocaleString()} retainage` : "";
-  const billFmt  = totalBilled     ? `$${Math.round(totalBilled    ).toLocaleString()} billed`    : "";
+  const retFmt = totalRetainage ? `$${Math.round(totalRetainage).toLocaleString()} retainage` : "";
+  const billFmt = totalBilled ? `$${Math.round(totalBilled).toLocaleString()} billed` : "";
   const collectFmt = totalCollected ? `, $${Math.round(totalCollected).toLocaleString()} collected` : "";
   return `AR Aging — ${payApps.length} pay apps (${billFmt}${collectFmt}${retFmt ? ", " + retFmt : ""})`;
 }
+
 
 // ─────────────────────────────────────────────────────────
 // 6. AP UNAPPROVED INVOICES → Invoice tracker notes
